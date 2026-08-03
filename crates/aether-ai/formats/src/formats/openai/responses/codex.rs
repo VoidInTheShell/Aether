@@ -1331,6 +1331,31 @@ fn codex_responses_lite_supports_request_body(provider_request_body: Option<&Val
     })
 }
 
+fn rewrite_codex_responses_system_messages_as_developer(
+    body_object: &mut serde_json::Map<String, Value>,
+) {
+    let Some(input) = body_object.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for item in input {
+        let Some(item_object) = item.as_object_mut() else {
+            continue;
+        };
+        let is_message = item_object
+            .get("type")
+            .and_then(Value::as_str)
+            .is_none_or(|item_type| item_type == "message");
+        let is_system_message = item_object
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| role == "system");
+        if is_message && is_system_message {
+            item_object.insert("role".to_string(), Value::String("developer".to_string()));
+        }
+    }
+}
+
 fn apply_codex_responses_lite_body_contract(
     body_object: &mut serde_json::Map<String, Value>,
     capabilities: &CodexResponsesModelCapabilities,
@@ -1785,6 +1810,7 @@ pub fn apply_codex_openai_responses_special_body_edits_with_source_model_and_cap
         body_rules,
     );
     apply_codex_responses_lite_body_contract(body_object, capabilities);
+    rewrite_codex_responses_system_messages_as_developer(body_object);
     strip_codex_cache_control_fields(provider_request_body);
     apply_codex_openai_responses_compact_body_edits(
         provider_request_body,
@@ -2927,6 +2953,123 @@ mod tests {
 
         assert_eq!(provider_request_body["store"], true);
         assert_eq!(provider_request_body["input"][0]["id"], "msg-1");
+    }
+
+    #[test]
+    fn codex_responses_body_edits_rewrite_message_system_roles_as_developer() {
+        for api_format in ["openai:responses", "openai:responses:compact"] {
+            let mut provider_request_body = json!({
+                "model": "gpt-5.4",
+                "input": [{
+                    "id": "system-1",
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "system-marker"}],
+                    "extra": true
+                }, {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "implicit-message-marker"}]
+                }, {
+                    "type": "function_call",
+                    "role": "system",
+                    "name": "non_message_item"
+                }]
+            });
+
+            apply_codex_openai_responses_special_body_edits(
+                &mut provider_request_body,
+                "codex",
+                api_format,
+                None,
+                None,
+            );
+
+            assert_eq!(provider_request_body["input"][0]["role"], "developer");
+            assert_eq!(provider_request_body["input"][0]["id"], "system-1");
+            assert_eq!(
+                provider_request_body["input"][0]["content"][0]["text"],
+                "system-marker"
+            );
+            assert_eq!(provider_request_body["input"][0]["extra"], true);
+            assert_eq!(provider_request_body["input"][1]["role"], "developer");
+            assert_eq!(provider_request_body["input"][2]["role"], "system");
+        }
+    }
+
+    #[test]
+    fn codex_responses_lite_rewrites_system_messages_without_duplicating_instructions() {
+        let mut provider_request_body = json!({
+            "model": "gpt-5.6-sol",
+            "instructions": "instructions-marker",
+            "input": [{
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": "system-marker"}]
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "user-marker"}]
+            }]
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert!(provider_request_body.get("instructions").is_none());
+        assert_eq!(
+            provider_request_body["input"][0]["type"],
+            "additional_tools"
+        );
+        assert_eq!(provider_request_body["input"][1]["role"], "developer");
+        assert_eq!(
+            provider_request_body["input"][1]["content"][0]["text"],
+            "instructions-marker"
+        );
+        assert_eq!(provider_request_body["input"][2]["role"], "developer");
+        assert_eq!(
+            provider_request_body["input"][2]["content"][0]["text"],
+            "system-marker"
+        );
+        assert_eq!(provider_request_body["input"][3]["role"], "user");
+        let serialized_body = provider_request_body.to_string();
+        assert_eq!(serialized_body.matches("instructions-marker").count(), 1);
+        assert_eq!(serialized_body.matches("system-marker").count(), 1);
+        assert!(provider_request_body["input"]
+            .as_array()
+            .is_some_and(|input| {
+                input.iter().all(|item| {
+                    item.get("role")
+                        .and_then(Value::as_str)
+                        .is_none_or(|role| role != "system")
+                })
+            }));
+    }
+
+    #[test]
+    fn codex_responses_body_edits_leave_non_codex_system_messages_unchanged() {
+        let mut provider_request_body = json!({
+            "model": "gpt-5.4",
+            "input": [{
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": "system-marker"}]
+            }]
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "openai",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert_eq!(provider_request_body["input"][0]["role"], "system");
     }
 
     #[test]
