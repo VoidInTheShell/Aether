@@ -2113,11 +2113,11 @@ impl TurnStateRuntime {
         }
         if stored || recovered {
             self.persist(app).await?;
-            return Ok(if stored {
+            Ok(if stored {
                 TurnStateHarvestResult::Stored
             } else {
                 TurnStateHarvestResult::Older
-            });
+            })
         } else {
             Ok(TurnStateHarvestResult::Older)
         }
