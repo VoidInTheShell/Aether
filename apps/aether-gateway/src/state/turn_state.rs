@@ -411,7 +411,7 @@ impl TurnStateRuntime {
             return;
         }
         let runtime = Arc::clone(&app.codex_turn_state);
-        let _ = crate::task_runtime::spawn_singleton_worker(
+        std::mem::drop(crate::task_runtime::spawn_singleton_worker(
             app,
             crate::task_runtime::TASK_KEY_CODEX_TURN_STATE,
             move |app| {
@@ -459,7 +459,7 @@ impl TurnStateRuntime {
                     }
                 }
             },
-        );
+        ));
     }
 
     async fn ensure_loaded(&self, app: &AppState) -> Result<(), GatewayError> {
