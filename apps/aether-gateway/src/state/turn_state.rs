@@ -446,11 +446,13 @@ impl TurnStateRuntime {
                         if due_keys.is_empty() || runtime.probe_is_running().await {
                             continue;
                         }
-                        let Ok(run) = runtime.start_probe(&app, Some(due_keys.clone())).await
+                        let Ok((run, claimed)) = runtime
+                            .start_probe_claim(&app, Some(due_keys.clone()))
+                            .await
                         else {
                             continue;
                         };
-                        if run.get("running").and_then(Value::as_bool) != Some(true) {
+                        if !claimed || run.get("running").and_then(Value::as_bool) != Some(true) {
                             continue;
                         }
                         Arc::clone(&runtime)
@@ -780,11 +782,14 @@ impl TurnStateRuntime {
         Ok(cleared)
     }
 
-    pub(crate) async fn start_probe(
+    /// Claim a probe run and report whether this caller changed the state from
+    /// idle to running.  The boolean prevents concurrent HTTP requests or the
+    /// renewal worker from spawning duplicate local tasks for one run.
+    pub(crate) async fn start_probe_claim(
         &self,
         app: &AppState,
         requested_key_ids: Option<Vec<String>>,
-    ) -> Result<Value, GatewayError> {
+    ) -> Result<(Value, bool), GatewayError> {
         self.ensure_loaded(app).await?;
         let scope = self.scope_raw(app).await?;
         let key_ids = requested_key_ids
@@ -797,7 +802,10 @@ impl TurnStateRuntime {
         {
             let mut memory = self.memory.write().await;
             if memory.probe_run.running {
-                return Ok(serde_json::to_value(&memory.probe_run).unwrap_or_else(|_| json!({})));
+                return Ok((
+                    serde_json::to_value(&memory.probe_run).unwrap_or_else(|_| json!({})),
+                    false,
+                ));
             }
             memory.probe_run = ProbeRun {
                 running: true,
@@ -809,7 +817,7 @@ impl TurnStateRuntime {
             };
         }
         self.persist(app).await?;
-        Ok(self.probe_run_json().await)
+        Ok((self.probe_run_json().await, true))
     }
 
     pub(crate) async fn cancel_probe(&self, app: &AppState) -> Result<Value, GatewayError> {
@@ -898,12 +906,14 @@ impl TurnStateRuntime {
             });
         }
         key_ids.dedup();
-        let models = scope
+        let mut models = scope
             .models
             .iter()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .collect::<Vec<_>>();
+        models.sort();
+        models.dedup();
 
         let config = self.config(app).await?;
         let concurrency = config.max_accounts_in_flight.max(1) as usize;
@@ -1300,6 +1310,7 @@ impl TurnStateRuntime {
 
         let mut attempted = false;
         let mut saw_degraded = false;
+        let mut saw_non_degraded = false;
         let mut last_degraded_exit = None;
 
         // Static exits are each tried at most once per bucket during their
@@ -1351,6 +1362,7 @@ impl TurnStateRuntime {
                     return ProbeOneOutcome::AccountLimited(status);
                 }
                 ProbeResponse::NetworkFailure => {
+                    saw_non_degraded = true;
                     self.set_exit_cooldown(
                         cooldown_key,
                         now.saturating_add(config.exit_cooldown_seconds.min(300)),
@@ -1359,7 +1371,9 @@ impl TurnStateRuntime {
                 }
                 ProbeResponse::NoTurnState
                 | ProbeResponse::UnknownLength(_)
-                | ProbeResponse::UpstreamFailure(_) => {}
+                | ProbeResponse::UpstreamFailure(_) => {
+                    saw_non_degraded = true;
+                }
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
@@ -1410,10 +1424,16 @@ impl TurnStateRuntime {
                         .await;
                         return ProbeOneOutcome::AccountLimited(status);
                     }
-                    ProbeResponse::NetworkFailure => rotating_degraded = false,
+                    ProbeResponse::NetworkFailure => {
+                        rotating_degraded = false;
+                        saw_non_degraded = true;
+                    }
                     ProbeResponse::NoTurnState
                     | ProbeResponse::UnknownLength(_)
-                    | ProbeResponse::UpstreamFailure(_) => rotating_degraded = false,
+                    | ProbeResponse::UpstreamFailure(_) => {
+                        rotating_degraded = false;
+                        saw_non_degraded = true;
+                    }
                 }
                 if attempt + 1 < config.rotating_max_attempts as usize {
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1456,11 +1476,13 @@ impl TurnStateRuntime {
                 ProbeResponse::NetworkFailure
                 | ProbeResponse::NoTurnState
                 | ProbeResponse::UnknownLength(_)
-                | ProbeResponse::UpstreamFailure(_) => {}
+                | ProbeResponse::UpstreamFailure(_) => {
+                    saw_non_degraded = true;
+                }
             }
         }
 
-        if saw_degraded {
+        if saw_degraded && !saw_non_degraded {
             ProbeOneOutcome::Degraded {
                 exit: last_degraded_exit,
             }
@@ -1542,7 +1564,11 @@ impl TurnStateRuntime {
             let Ok(chunk) = chunk else {
                 break;
             };
-            prefix_len = prefix_len.saturating_add(chunk.len());
+            let remaining = 1024usize.saturating_sub(prefix_len);
+            prefix_len = prefix_len.saturating_add(chunk.len().min(remaining));
+            if chunk.len() >= remaining {
+                break;
+            }
         }
         match aether_turn_state::classify_probe_response(
             Some(status),
@@ -1662,6 +1688,26 @@ impl TurnStateRuntime {
             memory.counters.harvest = memory.counters.harvest.saturating_add(1);
         }
         drop(memory);
+        // A probe-side 292 is a recovery signal even when the bucket CAS
+        // rejected an older Fernet timestamp.  Do this before the enclosing
+        // account round is finalized so a later 429 cannot erase the recovery.
+        let recovered = {
+            let mut memory = self.memory.write().await;
+            memory
+                .accounts
+                .entry(key_id.to_string())
+                .or_default()
+                .recover_model(model, current_unix_secs())
+        };
+        if recovered {
+            self.apply_verdict_health_transition(
+                app,
+                key_id,
+                VerdictTransition::Recovered,
+                &config,
+            )
+            .await?;
+        }
         self.persist(app).await
     }
 
@@ -1805,7 +1851,35 @@ impl TurnStateRuntime {
         self.ensure_loaded(app).await?;
         let config = self.config(app).await?;
         let now = current_unix_secs();
-        let memory = self.memory.read().await;
+        let memory = self.memory.read().await.clone();
+        let mut key_ids = std::collections::BTreeSet::new();
+        for key in memory.buckets.keys() {
+            if let Some((key_id, _)) = key.split_once('\0') {
+                key_ids.insert(key_id.to_string());
+            }
+        }
+        key_ids.extend(memory.accounts.keys().cloned());
+        let key_names = if key_ids.is_empty() {
+            BTreeMap::new()
+        } else {
+            match app
+                .read_provider_catalog_keys_by_ids(&key_ids.iter().cloned().collect::<Vec<_>>())
+                .await
+            {
+                Ok(keys) => keys
+                    .into_iter()
+                    .map(|key| (key.id, key.name))
+                    .collect::<BTreeMap<_, _>>(),
+                Err(_) => BTreeMap::new(),
+            }
+        };
+        let key_name = |key_id: &str| {
+            key_names
+                .get(key_id)
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| key_id.to_string())
+        };
         let mut buckets = Vec::with_capacity(memory.buckets.len());
         for (key, bucket) in &memory.buckets {
             let Some((key_id, model)) = key.split_once('\0') else {
@@ -1815,7 +1889,7 @@ impl TurnStateRuntime {
                 && template_usable(bucket.issued_at_unix, now, config.ttl_seconds);
             buckets.push(json!({
                 "key_id": key_id,
-                "key_name": key_id,
+                "key_name": key_name(key_id),
                 "model": model,
                 "ready": ready,
                 "ttl_remaining_seconds": ready.then(|| bucket.expires_at_unix.saturating_sub(now)),
@@ -1831,7 +1905,7 @@ impl TurnStateRuntime {
             .map(|(key_id, state)| {
                 json!({
                     "key_id": key_id,
-                    "key_name": key_id,
+                    "key_name": key_name(key_id),
                     "verdict": verdict_name(state.verdict),
                     "consecutive_degraded_rounds": state.consecutive_degraded_rounds,
                     "degraded_models": state.degraded_models,
@@ -1870,18 +1944,7 @@ impl TurnStateRuntime {
         if !config.enabled || !is_codex_plan(plan) {
             return Ok(());
         }
-        let model = plan
-            .model_name
-            .as_deref()
-            .or_else(|| {
-                plan.body
-                    .json_body
-                    .as_ref()
-                    .and_then(|body| body.get("model"))
-                    .and_then(Value::as_str)
-            })
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+        let model = turn_state_model_for_plan(plan, report_context.as_ref())
             .unwrap_or_default()
             .to_string();
         let key_id = plan.key_id.trim().to_string();
@@ -2014,7 +2077,7 @@ impl TurnStateRuntime {
                 .unwrap_or(true);
             if should_store {
                 memory.buckets.insert(
-                    key,
+                    key.clone(),
                     BucketState {
                         value: value.to_string(),
                         issued_at_unix,
@@ -2027,27 +2090,34 @@ impl TurnStateRuntime {
                     },
                 );
                 memory.counters.harvest = memory.counters.harvest.saturating_add(1);
-                recovered = memory
-                    .accounts
-                    .entry(key_id.to_string())
-                    .or_default()
-                    .recover_model(model, now);
                 stored = true;
             }
+            // A valid 292 is a recovery signal even when its Fernet timestamp
+            // is older than the bucket already held.  Bucket CAS and verdict
+            // recovery are intentionally independent state transitions.
+            recovered = memory
+                .accounts
+                .entry(key_id.to_string())
+                .or_default()
+                .recover_model(model, now);
         }
-        if stored {
-            if recovered {
-                let config = self.config(app).await?;
-                self.apply_verdict_health_transition(
-                    app,
-                    key_id,
-                    VerdictTransition::Recovered,
-                    &config,
-                )
-                .await?;
-            }
+        if recovered {
+            let config = self.config(app).await?;
+            self.apply_verdict_health_transition(
+                app,
+                key_id,
+                VerdictTransition::Recovered,
+                &config,
+            )
+            .await?;
+        }
+        if stored || recovered {
             self.persist(app).await?;
-            Ok(TurnStateHarvestResult::Stored)
+            return Ok(if stored {
+                TurnStateHarvestResult::Stored
+            } else {
+                TurnStateHarvestResult::Older
+            });
         } else {
             Ok(TurnStateHarvestResult::Older)
         }
@@ -2322,9 +2392,66 @@ fn redact_error(raw: &str) -> String {
     value
 }
 
+fn turn_state_model_for_plan<'a>(
+    plan: &'a ExecutionPlan,
+    report_context: Option<&'a Value>,
+) -> Option<&'a str> {
+    // `ExecutionPlan::model_name` is the client-facing model carried through
+    // the decision DTO.  The JSON request body is the terminal provider model
+    // after mapping/routing, so it must win when present; otherwise use the
+    // same mapped-model fallback used by passive harvesting.
+    plan.body
+        .json_body
+        .as_ref()
+        .and_then(|body| body.get("model"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            report_context
+                .and_then(|value| value.get("mapped_model"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            report_context
+                .and_then(|value| value.get("model"))
+                .and_then(Value::as_str)
+        })
+        .or(plan.model_name.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::redact_error;
+    use std::collections::BTreeMap;
+
+    use aether_contracts::{ExecutionPlan, RequestBody};
+    use serde_json::json;
+
+    use super::{redact_error, turn_state_model_for_plan};
+
+    fn sample_plan(body: serde_json::Value, model_name: &str) -> ExecutionPlan {
+        ExecutionPlan {
+            request_id: "request-1".to_string(),
+            candidate_id: None,
+            provider_name: Some("Codex".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.test/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(body),
+            stream: false,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some(model_name.to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        }
+    }
 
     #[test]
     fn proxy_credentials_are_redacted_from_error_details() {
@@ -2334,5 +2461,21 @@ mod tests {
         assert!(!message.contains("alice"));
         assert!(!message.contains("secret"));
         assert!(message.contains("***@example.com:8080/path"));
+    }
+
+    #[test]
+    fn terminal_provider_model_wins_over_client_model_name() {
+        let plan = sample_plan(json!({"model": "mapped-codex"}), "codex-client-alias");
+        assert_eq!(turn_state_model_for_plan(&plan, None), Some("mapped-codex"));
+    }
+
+    #[test]
+    fn report_context_mapped_model_is_used_for_binary_requests() {
+        let plan = sample_plan(json!({"input": []}), "codex-client-alias");
+        let context = json!({"mapped_model": "mapped-codex"});
+        assert_eq!(
+            turn_state_model_for_plan(&plan, Some(&context)),
+            Some("mapped-codex")
+        );
     }
 }

@@ -107,12 +107,14 @@ pub(super) async fn maybe_build_local_admin_turn_state_response(
             let requested = request_body
                 .and_then(|body| serde_json::from_slice::<ProbeRequest>(body).ok())
                 .and_then(|payload| payload.key_ids);
-            let run = runtime.start_probe(app, requested.clone()).await?;
-            let worker_runtime = Arc::clone(runtime);
-            let worker_app = app.clone();
-            tokio::spawn(async move {
-                worker_runtime.run_probe(worker_app, requested).await;
-            });
+            let (run, claimed) = runtime.start_probe_claim(app, requested.clone()).await?;
+            if claimed {
+                let worker_runtime = Arc::clone(runtime);
+                let worker_app = app.clone();
+                tokio::spawn(async move {
+                    worker_runtime.run_probe(worker_app, requested).await;
+                });
+            }
             return Ok(Some(Json(run).into_response()));
         }
         "proxy_check" if request_context.method() == http::Method::POST => {
