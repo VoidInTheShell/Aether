@@ -526,8 +526,8 @@ impl TurnStateRuntime {
                         key,
                         BucketState {
                             value,
-                            issued_at_unix: bucket.issued_at_unix.max(0) as u64,
-                            expires_at_unix: bucket.expires_at_unix.max(0) as u64,
+                            issued_at_unix: bucket.issued_at_unix_secs.max(0) as u64,
+                            expires_at_unix: bucket.expires_at_unix_secs.max(0) as u64,
                             source: bucket.source.as_str().to_string(),
                             last_exit: (!bucket.last_exit.is_empty()).then_some(bucket.last_exit),
                         },
@@ -642,7 +642,7 @@ impl TurnStateRuntime {
                 object.insert((*field).to_string(), value);
             }
         }
-        let mut config = serde_json::from_value(merged).unwrap_or_default();
+        let mut config: TurnStateConfig = serde_json::from_value(merged).unwrap_or_default();
         config.enabled = app
             .read_system_config_json_value("module.codex_turn_state.enabled")
             .await?
@@ -762,6 +762,7 @@ impl TurnStateRuntime {
         let value = Value::Bool(dry_run);
         app.upsert_system_config_json_value("module.codex_turn_state.dry_run", &value, None)
             .await
+            .map(|_| ())
     }
 
     pub(crate) async fn clear(&self, app: &AppState) -> Result<usize, GatewayError> {
