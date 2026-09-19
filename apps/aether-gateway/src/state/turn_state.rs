@@ -2289,8 +2289,50 @@ fn merge_masked_proxy_values(values: &mut [String], previous: &[String]) {
 fn redact_error(raw: &str) -> String {
     let mut value = raw.replace("authorization", "credential");
     value = value.replace("password", "secret");
+    for scheme in ["http://", "https://", "socks5://", "socks5h://"] {
+        let mut search_from = 0usize;
+        while let Some(relative_start) = value[search_from..].find(scheme) {
+            let start = search_from + relative_start;
+            let end = value[start..]
+                .char_indices()
+                .skip(1)
+                .find_map(|(offset, character)| {
+                    (character.is_whitespace()
+                        || matches!(character, ')' | ']' | '}' | '"' | '\'' | ',' | ';'))
+                    .then_some(start + offset)
+                })
+                .unwrap_or(value.len());
+            let candidate = value[start..end].to_string();
+            let Ok(parsed) = Url::parse(&candidate) else {
+                search_from = end;
+                continue;
+            };
+            if parsed.username().is_empty() && parsed.password().is_none() {
+                search_from = end;
+                continue;
+            }
+            let masked = mask_proxy(&candidate);
+            value.replace_range(start..end, &masked);
+            search_from = start + masked.len();
+        }
+    }
     if value.len() > 240 {
         value.truncate(240);
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_error;
+
+    #[test]
+    fn proxy_credentials_are_redacted_from_error_details() {
+        let message = redact_error(
+            "request failed for (https://alice:secret@example.com:8080/path), retrying",
+        );
+        assert!(!message.contains("alice"));
+        assert!(!message.contains("secret"));
+        assert!(message.contains("***@example.com:8080/path"));
+    }
 }
