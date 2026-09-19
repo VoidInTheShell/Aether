@@ -348,6 +348,11 @@ jobs:
           file: ./Dockerfile.app
           push: true
           platforms: linux/amd64,linux/arm64
+          # Keep the immutable image tags separate from the reusable BuildKit
+          # cache so later nightly runs and fork development builds can reuse
+          # unchanged layers without rebuilding the full multi-arch image.
+          cache-from: type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache,mode=max
           tags: |
             ${{ env.GHCR_IMAGE }}:nightly
             ${{ env.GHCR_IMAGE }}:nightly-${{ needs.source.outputs.sha }}
