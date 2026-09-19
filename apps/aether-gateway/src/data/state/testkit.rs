@@ -193,8 +193,6 @@ impl GatewayDataState {
             request_candidate_writer: Some(request_candidate_writer),
             codex_turn_state_bucket_reader: None,
             codex_turn_state_bucket_writer: None,
-            codex_turn_state_bucket_reader: None,
-            codex_turn_state_bucket_writer: None,
             provider_catalog_reader: Some(provider_catalog_reader),
             provider_catalog_writer: Some(provider_catalog_writer),
             pool_score_reader: None,

@@ -107,7 +107,7 @@ async fn assert_admin_modules_status_with_smtp_password(
                     .as_object()
                     .expect("module list should be an object")
                     .len(),
-                14
+                15
             );
             assert_eq!(payload["management_tokens"]["active"], json!(true));
             &payload["important_notification"]

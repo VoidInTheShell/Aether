@@ -55,7 +55,6 @@ pub fn expires_at_unix_secs(issued_at_unix_secs: u64, ttl_seconds: u64) -> u64 {
 mod tests {
     use super::*;
     use base64::engine::general_purpose::URL_SAFE;
-    use base64::Engine as _;
 
     fn token(timestamp: u64, version: u8) -> String {
         let mut bytes = vec![0_u8; 32];

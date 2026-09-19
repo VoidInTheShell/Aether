@@ -2,17 +2,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::fernet::template_usable;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum InjectMode {
+    #[default]
     ReplaceOnly,
     Always,
-}
-
-impl Default for InjectMode {
-    fn default() -> Self {
-        Self::ReplaceOnly
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,7 +144,8 @@ mod tests {
     #[test]
     fn replace_only_only_substitutes_312() {
         let template = template();
-        let mut degraded = input(Some(&"d".repeat(312)), InjectMode::ReplaceOnly);
+        let degraded_value = "d".repeat(312);
+        let mut degraded = input(Some(&degraded_value), InjectMode::ReplaceOnly);
         degraded.template = Some(&template);
         let decision = decide_header(degraded);
         assert_eq!(decision.action, DecisionAction::Substitute);
@@ -179,7 +175,8 @@ mod tests {
     fn future_or_expired_template_is_never_used() {
         let mut future = template();
         future.issued_at_unix_secs = 200;
-        let mut input = input(Some(&"d".repeat(312)), InjectMode::Always);
+        let degraded_value = "d".repeat(312);
+        let mut input = input(Some(&degraded_value), InjectMode::Always);
         input.template = Some(&future);
         assert_eq!(decide_header(input).action, DecisionAction::Pass);
 
