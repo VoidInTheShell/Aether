@@ -75,6 +75,49 @@ pub(crate) fn project_local_success_health(
     Some(Value::Object(health_by_format))
 }
 
+/// Project a module-owned account verdict onto the provider health view.
+///
+/// Turn-State degradation is not an ordinary HTTP failure, so it must not be
+/// fed through the local-failover classifier.  Keep the existing per-format
+/// fields and only lower the score to the documented floor; the regular CAS
+/// writer still arbitrates this projection with other health producers.
+pub(crate) fn project_local_degraded_health(
+    current_health_by_format: Option<&Value>,
+    api_format: &str,
+    observed_at_unix_secs: u64,
+) -> Option<Value> {
+    let api_format = api_format.trim();
+    if api_format.is_empty() {
+        return None;
+    }
+
+    let mut health_by_format = current_health_by_format
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut current = health_by_format
+        .get(api_format)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let consecutive_failures = current
+        .get("consecutive_failures")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        .saturating_add(1);
+    current.insert("health_score".to_string(), json!(LOCAL_HEALTH_SCORE_FLOOR));
+    current.insert(
+        "consecutive_failures".to_string(),
+        json!(consecutive_failures),
+    );
+    current.insert(
+        "last_failure_at".to_string(),
+        json!(unix_secs_to_rfc3339(observed_at_unix_secs)),
+    );
+    health_by_format.insert(api_format.to_string(), Value::Object(current));
+    Some(Value::Object(health_by_format))
+}
+
 pub(crate) fn project_local_key_circuit_open(
     current_circuit_by_format: Option<&Value>,
     api_format: &str,

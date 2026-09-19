@@ -16,6 +16,8 @@ export interface PoolMobileTagInput {
   planLabel?: string | null
   orgLabel?: string | null
   proxyLabel?: string | null
+  /** codex_turn_state 模块判定降智时传入（如 "降智"），danger 红色 */
+  degradedLabel?: string | null
 }
 
 export type PoolMobileActionId =
@@ -57,6 +59,7 @@ export function buildPoolMobileTagItems(input: PoolMobileTagInput): PoolMobileTa
     createTagItem('auth', input.authLabel, 'default'),
     createTagItem('plan', input.planLabel, 'accent'),
     createTagItem('org', input.orgLabel, 'accent'),
+    createTagItem('degraded', input.degradedLabel, 'danger'),
     createTagItem('proxy', input.proxyLabel, 'muted'),
   ].filter((item): item is PoolMobileTagItem => item !== null)
 }

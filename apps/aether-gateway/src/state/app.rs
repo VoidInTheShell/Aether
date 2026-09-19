@@ -32,7 +32,7 @@ use super::{
     AdminWalletPaymentOrderRecord, AdminWalletRefundRecord, AdminWalletTransactionRecord,
     CachedProviderTransportSnapshot, FrontdoorCorsConfig, LocalExecutionRuntimeMissDiagnostic,
     LocalProviderDeleteTaskState, ProviderTransportSnapshotCacheKey,
-    ProviderTransportSnapshotFlight,
+    ProviderTransportSnapshotFlight, TurnStateRuntime,
 };
 
 const MIN_REQUEST_BODY_READ_TIMEOUT_MS: u64 = 1_000;
@@ -430,6 +430,7 @@ pub struct AppState {
     pub(crate) scheduler_affinity_epoch: Arc<AtomicU64>,
     pub(crate) dashboard_response_cache: Arc<DashboardResponseCache>,
     pub(crate) system_config_cache: Arc<SystemConfigCache>,
+    pub(crate) codex_turn_state: Arc<TurnStateRuntime>,
     pub(crate) endpoint_response_header_rules_cache: Arc<JsonValueCache<String>>,
     pub(crate) candidate_row_page_cache: Arc<super::super::cache::CandidateRowPageCache>,
     pub(crate) candidate_page_cache: Arc<super::super::cache::CandidatePageCache>,

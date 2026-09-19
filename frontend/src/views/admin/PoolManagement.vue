@@ -318,6 +318,14 @@
                         >
                           {{ keyUiStateMap[key.key_id]?.oauthOrgBadge?.label }}
                         </Badge>
+                        <Badge
+                          v-if="turnStateDegradedKeyIds.has(key.key_id)"
+                          variant="outline"
+                          class="text-[9px] px-1 py-0 h-4 shrink-0 border-destructive/40 bg-destructive/10 text-destructive"
+                          title="该账号被判定降智，处置与恢复见「Codex 状态复用」模块"
+                        >
+                          降智
+                        </Badge>
                       </div>
                     </div>
                   </div>
@@ -335,6 +343,7 @@
                     :reset-credit-items="getCodexResetCreditItemTexts(key)"
                     :can-consume-reset-credit="canConsumeCodexResetCredit(key)"
                     :consuming-reset-credit="consumingCodexResetCreditKeyId === key.key_id"
+                    :turn-state-items="turnStateItemsByKeyId[key.key_id] || []"
                     @consume-reset-credit="handleConsumeCodexResetCredit(key)"
                   />
                 </TableCell>
@@ -718,6 +727,7 @@
                 :reset-credit-items="getCodexResetCreditItemTexts(key)"
                 :can-consume-reset-credit="canConsumeCodexResetCredit(key)"
                 :consuming-reset-credit="consumingCodexResetCreditKeyId === key.key_id"
+                :turn-state-items="turnStateItemsByKeyId[key.key_id] || []"
                 variant="mobile"
                 @consume-reset-credit="handleConsumeCodexResetCredit(key)"
               />
@@ -1110,7 +1120,8 @@ import PoolDemandMetricsDialog from '@/features/pool/components/PoolDemandMetric
 import PoolAccountBatchDialog from '@/features/pool/components/PoolAccountBatchDialog.vue'
 import PoolKeyBatchEditDialog from '@/features/pool/components/PoolKeyBatchEditDialog.vue'
 import PoolManagementHeader from '@/features/pool/components/PoolManagementHeader.vue'
-import PoolKeyQuotaPanel from '@/features/pool/components/PoolKeyQuotaPanel.vue'
+import PoolKeyQuotaPanel, { type PoolTurnStateDisplayItem } from '@/features/pool/components/PoolKeyQuotaPanel.vue'
+import { codexTurnStateApi, type TurnStateAccountHealth, type TurnStateBucket } from '@/api/codex-turn-state'
 import PoolKeyStatsPanel from '@/features/pool/components/PoolKeyStatsPanel.vue'
 import KeyAllowedModelsEditDialog from '@/features/providers/components/KeyAllowedModelsEditDialog.vue'
 import KeyFormDialog from '@/features/providers/components/KeyFormDialog.vue'
@@ -2503,6 +2514,7 @@ async function loadKeys(options: { cacheTtlMs?: number, silent?: boolean } = {})
     }
     keyPage.value = nextPage
     keysLoadedOnce.value = true
+    void loadTurnStateBuckets()
   } catch (err) {
     if (requestId !== keysRequestId || selectedProviderId.value !== providerId) return
     if (!options.silent) {
@@ -2518,6 +2530,60 @@ async function loadKeys(options: { cacheTtlMs?: number, silent?: boolean } = {})
     }
   }
 }
+
+// --- Codex Turn-State 桶状态（codex_turn_state 模块；模块未上线时静默降级为空） ---
+const turnStateBuckets = ref<TurnStateBucket[]>([])
+const turnStateAccounts = ref<TurnStateAccountHealth[]>([])
+let turnStateRequestId = 0
+
+async function loadTurnStateBuckets() {
+  if (selectedProviderType.value !== 'codex') {
+    turnStateBuckets.value = []
+    turnStateAccounts.value = []
+    return
+  }
+  const requestId = ++turnStateRequestId
+  try {
+    const status = await codexTurnStateApi.getStatus()
+    if (requestId !== turnStateRequestId) return
+    turnStateBuckets.value = status.buckets
+    turnStateAccounts.value = status.accounts ?? []
+  } catch {
+    // 模块未启用或接口未上线：不打扰号池页主流程
+    if (requestId === turnStateRequestId) {
+      turnStateBuckets.value = []
+      turnStateAccounts.value = []
+    }
+  }
+}
+
+const turnStateDegradedKeyIds = computed(() => new Set(
+  turnStateAccounts.value
+    .filter(account => account.verdict === 'degraded')
+    .map(account => account.key_id),
+))
+
+function formatTurnStateTtl(seconds: number | null): string | null {
+  if (seconds == null) return null
+  if (seconds >= 60) return `${Math.floor(seconds / 60)}分钟`
+  return `${seconds}秒`
+}
+
+const turnStateItemsByKeyId = computed<Record<string, PoolTurnStateDisplayItem[]>>(() => {
+  const map: Record<string, PoolTurnStateDisplayItem[]> = {}
+  for (const bucket of turnStateBuckets.value) {
+    if (!map[bucket.key_id]) map[bucket.key_id] = []
+    map[bucket.key_id].push({
+      model: bucket.model,
+      ready: bucket.ready,
+      ttlText: bucket.ready ? formatTurnStateTtl(bucket.ttl_remaining_seconds) : null,
+    })
+  }
+  for (const items of Object.values(map)) {
+    items.sort((a, b) => a.model.localeCompare(b.model))
+  }
+  return map
+})
 
 watch(currentPage, () => {
   void loadKeys({ cacheTtlMs: POOL_KEYS_CACHE_TTL_MS })
@@ -3384,6 +3450,7 @@ function getMobileTagItems(key: PoolKeyDetail): PoolMobileTagItem[] {
     authLabel: getAuthTypeChipLabel(key),
     planLabel: planType ? formatOAuthPlanType(planType) : null,
     orgLabel: orgBadge?.label ?? null,
+    degradedLabel: turnStateDegradedKeyIds.value.has(key.key_id) ? '降智' : null,
     proxyLabel: key.proxy?.node_id ? '独立代理' : null,
   })
 }

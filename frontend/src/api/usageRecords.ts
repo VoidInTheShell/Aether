@@ -65,5 +65,7 @@ export interface UsageRecord {
   response_time_updated_at?: string | null
   has_fallback?: boolean
   has_retry?: boolean
+  /** codex_turn_state 模块在请求时刻对所用账号的降智判定；无模块数据时为空 */
+  turn_state_verdict?: 'normal' | 'suspected' | 'degraded' | null
   image_progress?: ImageProgress | null
 }

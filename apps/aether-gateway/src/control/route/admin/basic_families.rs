@@ -7,7 +7,34 @@ pub(super) fn classify_admin_basic_family_route(
     normalized_path: &str,
     normalized_path_no_trailing: &str,
 ) -> Option<ClassifiedRoute> {
-    if method == http::Method::GET
+    if normalized_path.starts_with("/api/admin/modules/codex-turn-state/") {
+        let route_kind = match (method, normalized_path_no_trailing) {
+            (&http::Method::GET, "/api/admin/modules/codex-turn-state/status") => "status",
+            (&http::Method::GET, "/api/admin/modules/codex-turn-state/scope") => "scope_get",
+            (&http::Method::PUT, "/api/admin/modules/codex-turn-state/scope") => "scope_set",
+            (&http::Method::GET, "/api/admin/modules/codex-turn-state/config") => "config_get",
+            (&http::Method::PUT, "/api/admin/modules/codex-turn-state/config") => "config_set",
+            (&http::Method::POST, "/api/admin/modules/codex-turn-state/probe/start") => {
+                "probe_start"
+            }
+            (&http::Method::POST, "/api/admin/modules/codex-turn-state/probe/cancel") => {
+                "probe_cancel"
+            }
+            (&http::Method::POST, "/api/admin/modules/codex-turn-state/proxy-check") => {
+                "proxy_check"
+            }
+            (&http::Method::PUT, "/api/admin/modules/codex-turn-state/dry-run") => "dry_run",
+            (&http::Method::POST, "/api/admin/modules/codex-turn-state/clear") => "clear",
+            _ => return None,
+        };
+        Some(classified(
+            "admin_proxy",
+            "codex_turn_state_manage",
+            route_kind,
+            "admin:modules",
+            false,
+        ))
+    } else if method == http::Method::GET
         && matches!(
             normalized_path,
             "/api/admin/management-tokens/permissions/catalog"

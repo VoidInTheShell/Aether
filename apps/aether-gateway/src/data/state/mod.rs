@@ -110,6 +110,10 @@ use aether_data_contracts::repository::candidates::{
     PublicHealthStatusCount, PublicHealthTimelineBucket, RequestCandidateReadRepository,
     RequestCandidateWriteRepository, StoredRequestCandidate, UpsertRequestCandidateRecord,
 };
+use aether_data_contracts::repository::codex_turn_state::{
+    CodexTurnStateBucketReadRepository, CodexTurnStateBucketWriteRepository,
+    StoredCodexTurnStateBucket, UpsertCodexTurnStateBucket,
+};
 use aether_data_contracts::repository::global_models::{
     AdminGlobalModelListQuery, AdminProviderModelListQuery, CreateAdminGlobalModelRecord,
     GlobalModelReadRepository, GlobalModelWriteRepository, PublicCatalogModelListQuery,
@@ -191,6 +195,8 @@ pub(crate) struct GatewayDataState {
     minimal_candidate_selection_reader: Option<Arc<dyn MinimalCandidateSelectionReadRepository>>,
     request_candidate_reader: Option<Arc<dyn RequestCandidateReadRepository>>,
     request_candidate_writer: Option<Arc<dyn RequestCandidateWriteRepository>>,
+    codex_turn_state_bucket_reader: Option<Arc<dyn CodexTurnStateBucketReadRepository>>,
+    codex_turn_state_bucket_writer: Option<Arc<dyn CodexTurnStateBucketWriteRepository>>,
     provider_catalog_reader: Option<Arc<dyn ProviderCatalogReadRepository>>,
     provider_catalog_writer: Option<Arc<dyn ProviderCatalogWriteRepository>>,
     pool_score_reader: Option<Arc<dyn PoolScoreReadRepository>>,
@@ -343,6 +349,14 @@ impl fmt::Debug for GatewayDataState {
                 &self.request_candidate_writer.is_some(),
             )
             .field(
+                "has_codex_turn_state_bucket_reader",
+                &self.codex_turn_state_bucket_reader.is_some(),
+            )
+            .field(
+                "has_codex_turn_state_bucket_writer",
+                &self.codex_turn_state_bucket_writer.is_some(),
+            )
+            .field(
                 "has_provider_catalog_reader",
                 &self.provider_catalog_reader.is_some(),
             )
@@ -389,6 +403,7 @@ mod auth;
 mod auth_api_key_cache;
 mod candidate_cache;
 mod catalog;
+mod codex_turn_state;
 mod core;
 mod integrations;
 mod models;

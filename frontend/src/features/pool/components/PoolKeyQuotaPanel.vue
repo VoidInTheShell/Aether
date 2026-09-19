@@ -29,11 +29,12 @@
       {{ accountQuotaText || fallbackText }}
     </div>
     <div
-      v-else
+      v-else-if="!turnStateItems.length"
       class="text-muted-foreground"
     >
       -
     </div>
+    <TurnStateRows mobile />
   </div>
 
   <template v-else>
@@ -50,17 +51,21 @@
         {{ accountQuotaText }}
       </div>
       <ResetCredits />
+      <TurnStateRows />
     </div>
-    <span
-      v-else-if="accountQuotaText || fallbackText"
-      :class="textClass"
-    >
-      {{ accountQuotaText || fallbackText }}
-    </span>
-    <span
-      v-else
-      class="text-xs text-muted-foreground"
-    >-</span>
+    <template v-else>
+      <span
+        v-if="accountQuotaText || fallbackText"
+        :class="textClass"
+      >
+        {{ accountQuotaText || fallbackText }}
+      </span>
+      <span
+        v-else-if="!turnStateItems.length"
+        class="text-xs text-muted-foreground"
+      >-</span>
+      <TurnStateRows />
+    </template>
   </template>
 </template>
 
@@ -78,6 +83,14 @@ export interface PoolQuotaProgressDisplayItem {
   numericOnly?: boolean
 }
 
+/** Codex Turn-State 桶状态展示项（codex_turn_state 模块，按模型一格） */
+export interface PoolTurnStateDisplayItem {
+  model: string
+  ready: boolean
+  /** 已格式化的剩余有效期，如 "47 分钟"；空桶为 null */
+  ttlText: string | null
+}
+
 const props = withDefaults(defineProps<{
   items: PoolQuotaProgressDisplayItem[]
   accountQuotaText?: string | null
@@ -88,6 +101,7 @@ const props = withDefaults(defineProps<{
   resetCreditItems?: string[]
   canConsumeResetCredit?: boolean
   consumingResetCredit?: boolean
+  turnStateItems?: PoolTurnStateDisplayItem[]
 }>(), {
   accountQuotaText: null,
   fallbackText: null,
@@ -97,6 +111,7 @@ const props = withDefaults(defineProps<{
   resetCreditItems: () => [],
   canConsumeResetCredit: false,
   consumingResetCredit: false,
+  turnStateItems: () => [],
 })
 
 const emit = defineEmits<{
@@ -130,6 +145,42 @@ const ResetCredits = defineComponent({
     ]) : null
   },
 })
+
+const TurnStateRows = defineComponent({
+  name: 'PoolTurnStateRows',
+  props: {
+    mobile: {
+      type: Boolean,
+      default: false,
+    },
+  },
+  setup() {
+    return () => props.turnStateItems.length ? h('div', {
+      'data-testid': 'pool-turn-state-rows',
+      class: 'mt-2 border-t border-border/50 pt-1.5 text-[10px] leading-4 text-muted-foreground',
+    }, [
+      h('div', { class: 'mb-1 flex items-center justify-between' }, [
+        h('span', legacyT('Turn-State')),
+        h('span', { class: 'tabular-nums' }, `${props.turnStateItems.filter(item => item.ready).length}/${props.turnStateItems.length} ${legacyT('就绪')}`),
+      ]),
+      h('div', { class: 'flex flex-wrap gap-1' }, props.turnStateItems.map(item => h('span', {
+        key: item.model,
+        'data-testid': 'pool-turn-state-chip',
+        title: item.ready ? `${item.model} · ${legacyT('剩余')} ${item.ttlText}` : `${item.model} · ${legacyT('空桶')}`,
+        class: [
+          'inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-mono tabular-nums',
+          item.ready
+            ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+            : 'border-border/60 bg-background/60 text-muted-foreground',
+        ],
+      }, `${shortModelName(item.model)} ${item.ready ? `✓${item.ttlText ? ` ${item.ttlText}` : ''}` : '—'}`))),
+    ]) : null
+  },
+})
+
+function shortModelName(model: string): string {
+  return model.replace(/^gpt-/, '')
+}
 
 const QuotaProgressRows = defineComponent({
   name: 'QuotaProgressRows',

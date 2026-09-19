@@ -27,6 +27,7 @@ members = [
     "crates/aether-runtime/state",
     "crates/aether-task/runtime",
     "crates/aether-task/core",
+    "crates/aether-turn-state",
     "crates/aether-gateway/frontdoor",
     "crates/aether-gateway/control",
     "crates/aether-gateway/execution",
@@ -80,6 +81,7 @@ aether-scheduler-core = { path = "crates/aether-scheduler-core" }
 aether-runtime-state = { path = "crates/aether-runtime/state" }
 aether-task-runtime = { path = "crates/aether-task/runtime" }
 aether-task-core = { path = "crates/aether-task/core" }
+aether-turn-state = { path = "crates/aether-turn-state" }
 aether-gateway-frontdoor = { path = "crates/aether-gateway/frontdoor" }
 aether-gateway-control = { path = "crates/aether-gateway/control" }
 aether-gateway-execution = { path = "crates/aether-gateway/execution" }

@@ -8,6 +8,7 @@ mod background_tasks;
 mod billing;
 mod candidate_selection;
 mod candidates;
+mod codex_turn_state;
 mod error;
 mod gemini_file_mappings;
 mod global_models;
@@ -38,6 +39,7 @@ pub use background_tasks::SqlxBackgroundTaskRepository;
 pub use billing::SqlxBillingReadRepository;
 pub use candidate_selection::SqlxMinimalCandidateSelectionReadRepository;
 pub use candidates::SqlxRequestCandidateReadRepository;
+pub use codex_turn_state::SqlxCodexTurnStateBucketRepository;
 pub use gemini_file_mappings::SqlxGeminiFileMappingRepository;
 pub use global_models::SqlxGlobalModelReadRepository;
 pub use lease::{

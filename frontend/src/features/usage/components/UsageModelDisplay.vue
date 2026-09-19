@@ -69,7 +69,7 @@ import { Badge } from '@/components/ui'
 import { isCyberPolicyError } from '../utils/cyberError'
 import { formatServiceTierFact } from '../utils/service-tier'
 
-type ModelBadgeKey = 'compact' | 'reasoning' | 'fast' | 'cyber' | 'reasoning_tokens'
+type ModelBadgeKey = 'compact' | 'reasoning' | 'degraded' | 'fast' | 'cyber' | 'reasoning_tokens'
 
 interface ModelBadgePresentation {
   key: ModelBadgeKey
@@ -88,6 +88,7 @@ interface UsageModelDisplayRecord {
   requested_reasoning_effort?: string | null
   reasoning_effort?: string | null
   service_tier?: string | null
+  turn_state_verdict?: string | null
   reasoning_tokens?: number
   error_message?: string | null
 }
@@ -151,6 +152,17 @@ const modelBadges = computed<ModelBadgePresentation[]>(() => {
       className: 'border-primary/30 bg-primary/5 text-primary',
       title: `Reasoning: ${reasoningLabel.value}`,
       ariaLabel: `Reasoning: ${reasoningLabel.value}`,
+    })
+  }
+
+  if (normalizeText(props.record.turn_state_verdict)?.toLowerCase() === 'degraded') {
+    badges.push({
+      key: 'degraded',
+      label: '降智',
+      variant: 'outline',
+      className: 'border-destructive/40 bg-destructive/10 text-destructive',
+      title: '该请求所用账号当时被判定降智（详见 Codex 状态复用模块）',
+      ariaLabel: '账号降智',
     })
   }
 

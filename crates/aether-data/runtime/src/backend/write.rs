@@ -8,6 +8,7 @@ use crate::repository::auth::AuthApiKeyWriteRepository;
 use crate::repository::auth_modules::AuthModuleWriteRepository;
 use crate::repository::background_tasks::BackgroundTaskWriteRepository;
 use crate::repository::candidates::RequestCandidateWriteRepository;
+use crate::repository::codex_turn_state::CodexTurnStateBucketWriteRepository;
 use crate::repository::gemini_file_mappings::GeminiFileMappingWriteRepository;
 use crate::repository::global_models::GlobalModelWriteRepository;
 use crate::repository::management_tokens::ManagementTokenWriteRepository;
@@ -29,6 +30,7 @@ pub struct DataWriteRepositories {
     auth_modules: Option<Arc<dyn AuthModuleWriteRepository>>,
     background_tasks: Option<Arc<dyn BackgroundTaskWriteRepository>>,
     request_candidates: Option<Arc<dyn RequestCandidateWriteRepository>>,
+    codex_turn_state_buckets: Option<Arc<dyn CodexTurnStateBucketWriteRepository>>,
     gemini_file_mappings: Option<Arc<dyn GeminiFileMappingWriteRepository>>,
     global_models: Option<Arc<dyn GlobalModelWriteRepository>>,
     management_tokens: Option<Arc<dyn ManagementTokenWriteRepository>>,
@@ -52,6 +54,10 @@ impl fmt::Debug for DataWriteRepositories {
             .field("has_auth_modules", &self.auth_modules.is_some())
             .field("has_background_tasks", &self.background_tasks.is_some())
             .field("has_request_candidates", &self.request_candidates.is_some())
+            .field(
+                "has_codex_turn_state_buckets",
+                &self.codex_turn_state_buckets.is_some(),
+            )
             .field(
                 "has_gemini_file_mappings",
                 &self.gemini_file_mappings.is_some(),
@@ -102,6 +108,11 @@ impl DataWriteRepositories {
         if self.request_candidates.is_none() {
             self.request_candidates =
                 Some(PostgresBackend::request_candidate_write_repository(backend));
+        }
+        if self.codex_turn_state_buckets.is_none() {
+            self.codex_turn_state_buckets = Some(
+                PostgresBackend::codex_turn_state_bucket_write_repository(backend),
+            );
         }
         if self.gemini_file_mappings.is_none() {
             self.gemini_file_mappings = Some(
@@ -178,6 +189,10 @@ impl DataWriteRepositories {
         self.request_candidates.clone()
     }
 
+    pub fn codex_turn_state_buckets(&self) -> Option<Arc<dyn CodexTurnStateBucketWriteRepository>> {
+        self.codex_turn_state_buckets.clone()
+    }
+
     pub fn gemini_file_mappings(&self) -> Option<Arc<dyn GeminiFileMappingWriteRepository>> {
         self.gemini_file_mappings.clone()
     }
@@ -232,6 +247,7 @@ impl DataWriteRepositories {
             || self.auth_modules.is_some()
             || self.background_tasks.is_some()
             || self.request_candidates.is_some()
+            || self.codex_turn_state_buckets.is_some()
             || self.gemini_file_mappings.is_some()
             || self.global_models.is_some()
             || self.management_tokens.is_some()

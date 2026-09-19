@@ -420,6 +420,8 @@ impl GatewayDataState {
                 minimal_candidate_selection_reader: None,
                 request_candidate_reader: None,
                 request_candidate_writer: None,
+                codex_turn_state_bucket_reader: None,
+                codex_turn_state_bucket_writer: None,
                 provider_catalog_reader: None,
                 provider_catalog_writer: None,
                 pool_score_reader: None,
@@ -485,6 +487,8 @@ impl GatewayDataState {
             ) as Arc<dyn RequestCandidateReadRepository>
         });
         let request_candidate_writer = backends.write().request_candidates();
+        let codex_turn_state_bucket_reader = backends.read().codex_turn_state_buckets();
+        let codex_turn_state_bucket_writer = backends.write().codex_turn_state_buckets();
         let gemini_file_mapping_writer = backends.write().gemini_file_mappings();
         let provider_catalog_reader = backends.read().provider_catalog().map(|repository| {
             Arc::new(
@@ -537,6 +541,8 @@ impl GatewayDataState {
             minimal_candidate_selection_reader,
             request_candidate_reader,
             request_candidate_writer,
+            codex_turn_state_bucket_reader,
+            codex_turn_state_bucket_writer,
             provider_catalog_reader,
             provider_catalog_writer,
             pool_score_reader,

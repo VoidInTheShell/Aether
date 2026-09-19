@@ -131,6 +131,12 @@ export const adminRoutes: RouteRecordRaw[] = [
         meta: { module: 'chat_pii_redaction' }
       },
       {
+        path: 'modules/codex-turn-state',
+        name: 'CodexTurnStateModule',
+        component: view(() => import('@/views/admin/modules/CodexTurnState.vue')),
+        meta: { module: 'codex_turn_state' }
+      },
+      {
         path: 'modules/s3-backup',
         name: 'S3BackupSettings',
         component: view(() => import('@/views/admin/modules/S3BackupSettings.vue')),

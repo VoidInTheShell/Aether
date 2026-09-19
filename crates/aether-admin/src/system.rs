@@ -1973,7 +1973,9 @@ pub fn build_admin_module_validation_result(
                 )
             }
         }
-        "management_tokens" | "model_directives" | "proxy_nodes" => (true, None),
+        "management_tokens" | "model_directives" | "proxy_nodes" | "codex_turn_state" => {
+            (true, None)
+        }
         _ => (true, None),
     }
 }
@@ -1989,7 +1991,8 @@ pub fn build_admin_module_health(
         | "important_notification"
         | "bark_push"
         | "server_chan_push"
-        | "s3_backup" => "healthy",
+        | "s3_backup"
+        | "codex_turn_state" => "healthy",
         "gemini_files" => {
             if gemini_files_has_capable_key {
                 "healthy"
@@ -2310,6 +2313,21 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "module.bark_push.server_url" => Some(json!(DEFAULT_BARK_API_BASE)),
         "module.bark_push.template" => Some(json!("")),
         "module.chat_pii_redaction.enabled" => Some(json!(false)),
+        "module.codex_turn_state.enabled" => Some(json!(false)),
+        "module.codex_turn_state.dry_run" => Some(json!(false)),
+        "module.codex_turn_state.inject_mode" => Some(json!("replace-only")),
+        "module.codex_turn_state.harvest_inband" => Some(json!(true)),
+        "module.codex_turn_state.degrade_action" => Some(json!("none")),
+        "module.codex_turn_state.degrade_threshold" => Some(json!(3)),
+        "module.codex_turn_state.ttl_seconds" => Some(json!(3600)),
+        "module.codex_turn_state.template_length" => Some(json!(292)),
+        "module.codex_turn_state.replace_length" => Some(json!(312)),
+        "module.codex_turn_state.auto_renew" => Some(json!(true)),
+        "module.codex_turn_state.renew_threshold_seconds" => Some(json!(300)),
+        "module.codex_turn_state.account_backoff_seconds" => Some(json!(600)),
+        "module.codex_turn_state.exit_cooldown_seconds" => Some(json!(3300)),
+        "module.codex_turn_state.rotating_max_attempts" => Some(json!(10)),
+        "module.codex_turn_state.max_accounts_in_flight" => Some(json!(4)),
         "module.chat_pii_redaction.rules" => Some(chat_pii_redaction_default_rules()),
         "module.chat_pii_redaction.cache_ttl_seconds" => Some(json!(300)),
         "module.chat_pii_redaction.placeholder_prefix" => Some(json!("AETHER")),
@@ -2788,7 +2806,11 @@ pub fn parse_admin_system_config_update(
         | "module.important_notification.enabled"
         | "module.important_notification.email_enabled"
         | "module.server_chan_push.enabled"
-        | "module.bark_push.enabled" => match value.as_bool() {
+        | "module.bark_push.enabled"
+        | "module.codex_turn_state.enabled"
+        | "module.codex_turn_state.dry_run"
+        | "module.codex_turn_state.harvest_inband"
+        | "module.codex_turn_state.auto_renew" => match value.as_bool() {
             Some(enabled) => value = json!(enabled),
             None if value.is_null() => {
                 value = admin_system_config_default_value(&normalized_key).unwrap_or(json!(false));
@@ -2800,6 +2822,54 @@ pub fn parse_admin_system_config_update(
                 ));
             }
         },
+        "module.codex_turn_state.inject_mode" => {
+            value = match value.as_str().map(str::trim) {
+                Some("replace-only" | "always") => json!(value.as_str().unwrap().trim()),
+                None if value.is_null() => json!("replace-only"),
+                _ => {
+                    return Err((
+                        http::StatusCode::BAD_REQUEST,
+                        json!({ "detail": "请求数据验证失败" }),
+                    ));
+                }
+            };
+        }
+        "module.codex_turn_state.degrade_action" => {
+            value = match value.as_str().map(str::trim) {
+                Some("none" | "downweight" | "disable") => json!(value.as_str().unwrap().trim()),
+                None if value.is_null() => json!("none"),
+                _ => {
+                    return Err((
+                        http::StatusCode::BAD_REQUEST,
+                        json!({ "detail": "请求数据验证失败" }),
+                    ));
+                }
+            };
+        }
+        "module.codex_turn_state.degrade_threshold" => {
+            value = validate_codex_turn_state_u64(value, 1, 10, 3)?;
+        }
+        "module.codex_turn_state.ttl_seconds" => {
+            value = validate_codex_turn_state_u64(value, 60, 86_400, 3_600)?;
+        }
+        "module.codex_turn_state.template_length" | "module.codex_turn_state.replace_length" => {
+            value = validate_codex_turn_state_u64(value, 1, 8_192, 292)?;
+        }
+        "module.codex_turn_state.renew_threshold_seconds" => {
+            value = validate_codex_turn_state_u64(value, 0, 3_600, 300)?;
+        }
+        "module.codex_turn_state.account_backoff_seconds" => {
+            value = validate_codex_turn_state_u64(value, 30, 86_400, 600)?;
+        }
+        "module.codex_turn_state.exit_cooldown_seconds" => {
+            value = validate_codex_turn_state_u64(value, 60, 86_400, 3_300)?;
+        }
+        "module.codex_turn_state.rotating_max_attempts" => {
+            value = validate_codex_turn_state_u64(value, 1, 100, 10)?;
+        }
+        "module.codex_turn_state.max_accounts_in_flight" => {
+            value = validate_codex_turn_state_u64(value, 1, 32, 4)?;
+        }
         "module.important_notification.email_recipients" => {
             value = normalize_string_list_config_value(value).map_err(|_| {
                 (
@@ -2971,6 +3041,22 @@ pub fn parse_admin_system_config_update(
         value,
         description,
     })
+}
+
+fn validate_codex_turn_state_u64(
+    value: serde_json::Value,
+    min: u64,
+    max: u64,
+    default: u64,
+) -> Result<serde_json::Value, (http::StatusCode, serde_json::Value)> {
+    match value.as_u64() {
+        Some(value) if (min..=max).contains(&value) => Ok(json!(value)),
+        None if value.is_null() => Ok(json!(default)),
+        _ => Err((
+            http::StatusCode::BAD_REQUEST,
+            json!({ "detail": "请求数据验证失败" }),
+        )),
+    }
 }
 
 pub fn build_admin_system_config_updated_payload(

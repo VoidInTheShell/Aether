@@ -26,6 +26,10 @@ use crate::repository::candidates::{
     RequestCandidateReadRepository, RequestCandidateWriteRepository,
     SqlxRequestCandidateReadRepository,
 };
+use crate::repository::codex_turn_state::{
+    CodexTurnStateBucketReadRepository, CodexTurnStateBucketWriteRepository,
+    SqlxCodexTurnStateBucketRepository,
+};
 use crate::repository::gemini_file_mappings::{
     GeminiFileMappingReadRepository, GeminiFileMappingWriteRepository,
     SqlxGeminiFileMappingRepository,
@@ -149,6 +153,18 @@ impl PostgresBackend {
 
     pub fn request_candidate_write_repository(&self) -> Arc<dyn RequestCandidateWriteRepository> {
         Arc::new(SqlxRequestCandidateReadRepository::new(self.pool_clone()))
+    }
+
+    pub fn codex_turn_state_bucket_read_repository(
+        &self,
+    ) -> Arc<dyn CodexTurnStateBucketReadRepository> {
+        Arc::new(SqlxCodexTurnStateBucketRepository::new(self.pool_clone()))
+    }
+
+    pub fn codex_turn_state_bucket_write_repository(
+        &self,
+    ) -> Arc<dyn CodexTurnStateBucketWriteRepository> {
+        Arc::new(SqlxCodexTurnStateBucketRepository::new(self.pool_clone()))
     }
 
     pub fn gemini_file_mapping_read_repository(&self) -> Arc<dyn GeminiFileMappingReadRepository> {

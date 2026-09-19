@@ -3947,6 +3947,19 @@ async fn execute_execution_runtime_stream_inner(
     let mut stage_trace = RequestStageTrace::from_env();
     let candidate_slot_started_at = Instant::now();
     ensure_execution_request_candidate_slot(state, &mut plan, &mut report_context).await;
+    if let Err(err) = state
+        .codex_turn_state
+        .apply_to_plan(state, &mut plan, &mut report_context)
+        .await
+    {
+        warn!(
+            event_name = "codex_turn_state_injection_failed",
+            log_type = "ops",
+            trace_id = %short_request_id(trace_id),
+            error = ?err,
+            "continuing stream request without Codex turn-state mutation"
+        );
+    }
     observe_gateway_stage_trace_ms(
         &mut stage_trace,
         "stream_candidate_slot",

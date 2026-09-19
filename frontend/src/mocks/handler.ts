@@ -911,6 +911,65 @@ function generateMockUsageRecords(count: number = 100) {
     model_version: undefined
   })
 
+  // 固定在首屏的 codex_turn_state 演示记录：降智账号（Free · fr***@gmail.com）产生的请求，
+  // 模型列在思考程度徽标旁显示红色「降智」标记。
+  const turnStateDemoBase = {
+    user_id: 'demo-user-uuid-0003',
+    username: 'Alice Chen',
+    user_email: 'alice@demo.aether.ai',
+    api_key: {
+      id: 'key-demo-turn-state',
+      name: 'Alice Key 1',
+      display: 'sk-ae...4242'
+    },
+    provider: 'codex',
+    api_key_name: 'codex-key-1',
+    provider_key_name: 'Free · fr***@gmail.com',
+    rate_multiplier: 1.0,
+    target_model: 'gpt-6-astra',
+    requested_reasoning_effort: 'high',
+    reasoning_effort: 'high',
+    api_format: 'openai:responses',
+    cache_creation_input_tokens: 0,
+    is_stream: true,
+    status_code: 200,
+    status: 'completed' as const,
+    has_fallback: false,
+    model_version: undefined,
+    turn_state_verdict: 'degraded' as const,
+  }
+  records.unshift(
+    {
+      ...turnStateDemoBase,
+      id: 'usage-demo-turn-state-1',
+      model: 'gpt-6-astra',
+      input_tokens: 4820,
+      output_tokens: 1360,
+      cache_read_input_tokens: 2048,
+      total_tokens: 6180,
+      cost: 0.0256,
+      actual_cost: 0.0211,
+      response_time_ms: 1830,
+      created_at: new Date(now - 2 * 60 * 1000).toISOString(),
+    },
+    {
+      ...turnStateDemoBase,
+      id: 'usage-demo-turn-state-2',
+      model: 'gpt-5.5',
+      target_model: 'gpt-5.5',
+      requested_reasoning_effort: 'medium',
+      reasoning_effort: 'medium',
+      input_tokens: 2210,
+      output_tokens: 640,
+      cache_read_input_tokens: 0,
+      total_tokens: 2850,
+      cost: 0.0118,
+      actual_cost: 0.0097,
+      response_time_ms: 1240,
+      created_at: new Date(now - 9 * 60 * 1000).toISOString(),
+    },
+  )
+
   return records
 }
 
@@ -1291,6 +1350,282 @@ function createMockCodexPoolKeys() {
       37,
     ),
   ]
+}
+
+// ========== Codex Turn-State 模块 mock ==========
+// 对应 src/api/codex-turn-state.ts。桶值本身不存在于 mock（也不存在于任何前端接口），
+// 这里只模拟状态机：桶就绪度、决策计数、探测运行、连通性测试。
+
+const MOCK_TURN_STATE_MODELS = ['gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-6-astra']
+
+/** 号池 Codex 账号展示名（打码邮箱），桶矩阵与账号级判定共用 */
+const MOCK_TURN_STATE_KEY_NAMES: Record<string, string> = {
+  'codex-pool-plus-dual': 'Plus · te***@gmail.com',
+  'codex-pool-team-weekly': 'Team · ma***@outlook.com',
+  'codex-pool-business-monthly': 'Biz · ad***@company.io',
+  'codex-pool-free-five-hour': 'Free · fr***@gmail.com',
+}
+
+interface MockTurnStateBucket {
+  key_id: string
+  key_name: string
+  model: string
+  ready: boolean
+  ttl_remaining_seconds: number | null
+  issued_at_unix: number | null
+  expires_at_unix: number | null
+  source: 'probe' | 'passive' | null
+  last_exit: string | null
+}
+
+const mockTurnStateScope = {
+  key_ids: ['codex-pool-plus-dual', 'codex-pool-team-weekly', 'codex-pool-business-monthly'],
+  models: [...MOCK_TURN_STATE_MODELS],
+  probe_proxies: [
+    'socks5://u****:p****@203.0.113.10:1080',
+    'http://u****:p****@198.51.100.23:8080',
+  ],
+  probe_proxies_rotating: [
+    'socks5h://u****:p****@gw.residential.example:7000',
+  ],
+}
+
+function createMockTurnStateBuckets(): MockTurnStateBucket[] {
+  const now = Math.floor(Date.now() / 1000)
+  const keyNames = MOCK_TURN_STATE_KEY_NAMES
+  // (key, model) -> [ready, ttl, source, exit]
+  // 注意：free-five-hour 不播种——它是预置的"降智中"账号，所有桶为空
+  const seed: Array<[string, string, number, 'probe' | 'passive', string]> = [
+    ['codex-pool-plus-dual', 'gpt-5.5', 2820, 'probe', '203.0.113.10'],
+    ['codex-pool-plus-dual', 'gpt-5.6-sol', 1935, 'passive', 'direct'],
+    ['codex-pool-plus-dual', 'gpt-6-astra', 540, 'probe', 'gw.residential.example'],
+    ['codex-pool-team-weekly', 'gpt-5.5', 3300, 'probe', '198.51.100.23'],
+    ['codex-pool-team-weekly', 'gpt-5.6-terra', 1210, 'passive', 'direct'],
+    ['codex-pool-business-monthly', 'gpt-5.5', 2460, 'probe', '203.0.113.10'],
+  ]
+  const seeded = new Set(seed.map(([keyId, model]) => `${keyId}:${model}`))
+  const buckets: MockTurnStateBucket[] = seed.map(([keyId, model, ttl, source, exit]) => ({
+    key_id: keyId,
+    key_name: keyNames[keyId],
+    model,
+    ready: true,
+    ttl_remaining_seconds: ttl,
+    issued_at_unix: now - (3600 - ttl),
+    expires_at_unix: now + ttl,
+    source,
+    last_exit: exit,
+  }))
+  // 空桶：覆盖所有 key × model 组合中未播种的部分
+  for (const [keyId, keyName] of Object.entries(keyNames)) {
+    for (const model of MOCK_TURN_STATE_MODELS) {
+      if (seeded.has(`${keyId}:${model}`)) continue
+      buckets.push({
+        key_id: keyId,
+        key_name: keyName,
+        model,
+        ready: false,
+        ttl_remaining_seconds: null,
+        issued_at_unix: null,
+        expires_at_unix: null,
+        source: null,
+        last_exit: null,
+      })
+    }
+  }
+  return buckets
+}
+
+const mockTurnStateBuckets = createMockTurnStateBuckets()
+
+const mockTurnStateCounters = {
+  harvest: 57,
+  substitute: 1321,
+  inject: 208,
+  pass: 9142,
+  skip: 13,
+}
+
+const mockTurnStateRuntime = {
+  dry_run: false,
+  probe: {
+    running: false,
+    started_at_unix: null as number | null,
+    finished_at_unix: null as number | null,
+    total: 0,
+    done: 0,
+    lines: [] as string[],
+    last_tick_unix: null as number | null,
+    targets: [] as Array<{ key_id: string; model: string }>,
+  },
+}
+
+// 模块策略配置（对应 GET/PUT /config）。内存态，与 src/api/codex-turn-state.ts 的 TurnStateConfig 对齐。
+const mockTurnStateConfig = {
+  inject_mode: 'replace-only' as 'replace-only' | 'always',
+  harvest_inband: true,
+  degrade_action: 'downweight' as 'none' | 'downweight' | 'disable',
+  degrade_threshold: 3,
+  ttl_seconds: 3600,
+  template_length: 292,
+  replace_length: 312,
+  auto_renew: true,
+  renew_threshold_seconds: 300,
+  account_backoff_seconds: 600,
+  exit_cooldown_seconds: 3300,
+  rotating_max_attempts: 10,
+  max_accounts_in_flight: 4,
+}
+
+/**
+ * 账号级降智判定的内存态（对应 status.accounts）。
+ * 轮次语义：一轮探测里该账号所有目标桶全出口 312 记一轮，达到 degrade_threshold 判 degraded；
+ * 任一桶采到 292 立即归零恢复。预置：free-five-hour 已降智（4 轮），team-weekly 疑似（1 轮，gpt-5.6-sol），
+ * 演示时点「开始探测」可看到 team-weekly 采到 292 自动恢复。
+ */
+const mockTurnStateAccountHealth: Record<string, {
+  consecutive_degraded_rounds: number
+  degraded_models: string[]
+  last_probe_at_unix: number | null
+  degraded_since_unix: number | null
+}> = {
+  'codex-pool-plus-dual': { consecutive_degraded_rounds: 0, degraded_models: [], last_probe_at_unix: Math.floor(Date.now() / 1000) - 900, degraded_since_unix: null },
+  'codex-pool-team-weekly': { consecutive_degraded_rounds: 1, degraded_models: ['gpt-5.6-sol'], last_probe_at_unix: Math.floor(Date.now() / 1000) - 900, degraded_since_unix: null },
+  'codex-pool-business-monthly': { consecutive_degraded_rounds: 0, degraded_models: [], last_probe_at_unix: Math.floor(Date.now() / 1000) - 900, degraded_since_unix: null },
+  'codex-pool-free-five-hour': { consecutive_degraded_rounds: 4, degraded_models: [...MOCK_TURN_STATE_MODELS], last_probe_at_unix: Math.floor(Date.now() / 1000) - 600, degraded_since_unix: Math.floor(Date.now() / 1000) - 3 * 3600 },
+}
+
+function mockTurnStateVerdict(keyId: string): 'normal' | 'suspected' | 'degraded' {
+  const health = mockTurnStateAccountHealth[keyId]
+  if (!health) return 'normal'
+  if (health.consecutive_degraded_rounds >= mockTurnStateConfig.degrade_threshold) return 'degraded'
+  if (health.consecutive_degraded_rounds > 0 || health.degraded_models.length > 0) return 'suspected'
+  return 'normal'
+}
+
+/** 清空桶，返回清掉的数量（改 TTL/长度指纹与手动清空共用） */
+function clearMockTurnStateBuckets(): number {
+  let cleared = 0
+  for (const bucket of mockTurnStateBuckets) {
+    if (bucket.ready) {
+      bucket.ready = false
+      bucket.ttl_remaining_seconds = null
+      bucket.issued_at_unix = null
+      bucket.expires_at_unix = null
+      bucket.source = null
+      bucket.last_exit = null
+      cleared += 1
+    }
+  }
+  return cleared
+}
+
+function advanceMockTurnStateProbe() {
+  const probe = mockTurnStateRuntime.probe
+  if (!probe.running || probe.started_at_unix == null) return
+  const now = Math.floor(Date.now() / 1000)
+  const elapsed = now - probe.started_at_unix
+  const targetDone = Math.min(probe.total, Math.floor(elapsed / 2))
+  while (probe.done < targetDone) {
+    const target = probe.targets[probe.done]
+    const bucket = mockTurnStateBuckets.find(b => b.key_id === target.key_id && b.model === target.model)
+    const label = bucket?.key_name ?? target.key_id
+    probe.done += 1
+    if (!bucket) continue
+    if (bucket.ready && (bucket.ttl_remaining_seconds ?? 0) > 1800) {
+      probe.lines.push(`skip     ${label} model=${target.model} (bucket fresh, exit cooldown 55min)`)
+      continue
+    }
+    const harvested = target.key_id !== 'codex-pool-free-five-hour' && (probe.done % 4) !== 0
+    const health = mockTurnStateAccountHealth[target.key_id]
+    if (harvested) {
+      bucket.ready = true
+      bucket.ttl_remaining_seconds = mockTurnStateConfig.ttl_seconds
+      bucket.issued_at_unix = now
+      bucket.expires_at_unix = now + mockTurnStateConfig.ttl_seconds
+      bucket.source = 'probe'
+      bucket.last_exit = mockTurnStateScope.probe_proxies.length
+        ? mockTurnStateScope.probe_proxies[probe.done % mockTurnStateScope.probe_proxies.length].split('@')[1] ?? 'proxy'
+        : 'direct'
+      mockTurnStateCounters.harvest += 1
+      probe.lines.push(`harvest  ${label} model=${target.model} len=${mockTurnStateConfig.template_length} (template stored)`)
+      if (health) {
+        const idx = health.degraded_models.indexOf(target.model)
+        if (idx >= 0) {
+          health.degraded_models.splice(idx, 1)
+          if (!health.degraded_models.length) {
+            health.consecutive_degraded_rounds = 0
+            health.degraded_since_unix = null
+            probe.lines.push(`recovered ${label} (采到 292，账号判定恢复正常)`)
+          }
+        }
+      }
+    } else {
+      if (health && !health.degraded_models.includes(target.model)) health.degraded_models.push(target.model)
+      probe.lines.push(target.key_id === 'codex-pool-free-five-hour'
+        ? `degraded ${label} model=${target.model} len=${mockTurnStateConfig.replace_length} (all exits 312, account backoff 10min)`
+        : `degraded ${label} model=${target.model} len=${mockTurnStateConfig.replace_length} (exit rotated, retry budget ${mockTurnStateConfig.rotating_max_attempts}/${mockTurnStateConfig.rotating_max_attempts})`)
+    }
+  }
+  if (probe.done >= probe.total) {
+    probe.running = false
+    probe.finished_at_unix = now
+    // 轮次结算：范围内账号所有目标模型都采不到正常态 → 记一轮；全恢复 → 归零
+    for (const keyId of mockTurnStateScope.key_ids) {
+      const health = mockTurnStateAccountHealth[keyId]
+      if (!health) continue
+      health.last_probe_at_unix = now
+      const scopeModels = mockTurnStateScope.models
+      if (scopeModels.length > 0 && scopeModels.every(model => health.degraded_models.includes(model))) {
+        health.consecutive_degraded_rounds += 1
+        if (health.consecutive_degraded_rounds >= mockTurnStateConfig.degrade_threshold && health.degraded_since_unix == null) {
+          health.degraded_since_unix = now
+          probe.lines.push(`degraded ${MOCK_TURN_STATE_KEY_NAMES[keyId] ?? keyId} 连续 ${health.consecutive_degraded_rounds} 轮全出口 312，判定账号级降智（${mockTurnStateConfig.degrade_action}）`)
+        }
+      } else if (!health.degraded_models.length) {
+        health.consecutive_degraded_rounds = 0
+        health.degraded_since_unix = null
+      }
+    }
+    probe.lines.push(`done     ${probe.total} 个桶巡检完成`)
+  }
+}
+
+function mockTurnStateStatus() {
+  advanceMockTurnStateProbe()
+  const now = Math.floor(Date.now() / 1000)
+  for (const bucket of mockTurnStateBuckets) {
+    if (bucket.ready && bucket.expires_at_unix != null) {
+      bucket.ttl_remaining_seconds = Math.max(0, bucket.expires_at_unix - now)
+      if (bucket.ttl_remaining_seconds === 0) bucket.ready = false
+    }
+  }
+  return {
+    enabled: MOCK_MODULE_STATUSES.codex_turn_state?.enabled ?? true,
+    dry_run: mockTurnStateRuntime.dry_run,
+    buckets: mockTurnStateBuckets,
+    accounts: Object.entries(MOCK_TURN_STATE_KEY_NAMES).map(([keyId, keyName]) => {
+      const health = mockTurnStateAccountHealth[keyId]
+      return {
+        key_id: keyId,
+        key_name: keyName,
+        verdict: mockTurnStateVerdict(keyId),
+        consecutive_degraded_rounds: health?.consecutive_degraded_rounds ?? 0,
+        degraded_models: [...(health?.degraded_models ?? [])],
+        last_probe_at_unix: health?.last_probe_at_unix ?? null,
+        degraded_since_unix: health?.degraded_since_unix ?? null,
+      }
+    }),
+    counters: { ...mockTurnStateCounters },
+    counters_since_unix: now - 6 * 3600,
+    probe_run: {
+      running: mockTurnStateRuntime.probe.running,
+      started_at_unix: mockTurnStateRuntime.probe.started_at_unix,
+      finished_at_unix: mockTurnStateRuntime.probe.finished_at_unix,
+      total: mockTurnStateRuntime.probe.total,
+      done: mockTurnStateRuntime.probe.done,
+      lines: [...mockTurnStateRuntime.probe.lines],
+    },
+  }
 }
 
 /**
@@ -2782,6 +3117,132 @@ registerDynamicRoute('PUT', '/api/admin/modules/status/:moduleName/enabled', asy
   }
   MOCK_MODULE_STATUSES[params.moduleName] = updated
   return createMockResponse(updated)
+})
+
+// ========== Codex Turn-State 模块 ==========
+registerDynamicRoute('GET', '/api/admin/modules/codex-turn-state/status', async () => {
+  await delay()
+  requireAdmin()
+  return createMockResponse(mockTurnStateStatus())
+})
+
+registerDynamicRoute('GET', '/api/admin/modules/codex-turn-state/scope', async () => {
+  await delay()
+  requireAdmin()
+  return createMockResponse(JSON.parse(JSON.stringify(mockTurnStateScope)))
+})
+
+registerDynamicRoute('PUT', '/api/admin/modules/codex-turn-state/scope', async (config) => {
+  await delay()
+  requireAdmin()
+  const body = JSON.parse(config.data || '{}') as Partial<typeof mockTurnStateScope>
+  if (Array.isArray(body.key_ids)) mockTurnStateScope.key_ids = body.key_ids.filter(v => typeof v === 'string')
+  if (Array.isArray(body.models)) mockTurnStateScope.models = body.models.filter(v => typeof v === 'string')
+  if (Array.isArray(body.probe_proxies)) mockTurnStateScope.probe_proxies = body.probe_proxies.filter(v => typeof v === 'string')
+  if (Array.isArray(body.probe_proxies_rotating)) mockTurnStateScope.probe_proxies_rotating = body.probe_proxies_rotating.filter(v => typeof v === 'string')
+  return createMockResponse(JSON.parse(JSON.stringify(mockTurnStateScope)))
+})
+
+registerDynamicRoute('POST', '/api/admin/modules/codex-turn-state/probe/start', async (config) => {
+  await delay()
+  requireAdmin()
+  const probe = mockTurnStateRuntime.probe
+  if (!probe.running) {
+    const body = JSON.parse(config.data || '{}') as { key_ids?: string[] }
+    // 定向探测（账号行「立即探测」）只巡检指定账号；否则按探测范围全量
+    const scopedKeyIds = Array.isArray(body.key_ids) && body.key_ids.length
+      ? body.key_ids.filter(v => typeof v === 'string')
+      : [...mockTurnStateScope.key_ids]
+    const targets: Array<{ key_id: string; model: string }> = []
+    for (const keyId of scopedKeyIds) {
+      for (const model of mockTurnStateScope.models) targets.push({ key_id: keyId, model })
+    }
+    // 降智 > 疑似 > 正常：降智账号排最前，优先抢出口恢复
+    const verdictRank = (keyId: string) => ({ degraded: 0, suspected: 1, normal: 2 })[mockTurnStateVerdict(keyId)]
+    targets.sort((a, b) => verdictRank(a.key_id) - verdictRank(b.key_id))
+    probe.running = true
+    probe.started_at_unix = Math.floor(Date.now() / 1000)
+    probe.finished_at_unix = null
+    probe.total = targets.length
+    probe.done = 0
+    const priorityNote = scopedKeyIds.some(id => mockTurnStateVerdict(id) === 'degraded')
+      ? '，降智账号已排至队首优先恢复'
+      : ''
+    probe.lines = [`start    ${targets.length} 个桶进入探测队列（静态池 ${mockTurnStateScope.probe_proxies.length} 条 / 轮换池 ${mockTurnStateScope.probe_proxies_rotating.length} 条${priorityNote}）`]
+    probe.targets = targets
+  }
+  return createMockResponse(mockTurnStateStatus().probe_run)
+})
+
+registerDynamicRoute('POST', '/api/admin/modules/codex-turn-state/probe/cancel', async () => {
+  await delay()
+  requireAdmin()
+  const probe = mockTurnStateRuntime.probe
+  if (probe.running) {
+    probe.running = false
+    probe.finished_at_unix = Math.floor(Date.now() / 1000)
+    probe.lines.push(`cancel   操作员取消，已完成 ${probe.done}/${probe.total}`)
+  }
+  return createMockResponse(mockTurnStateStatus().probe_run)
+})
+
+registerDynamicRoute('POST', '/api/admin/modules/codex-turn-state/proxy-check', async () => {
+  await delay(600)
+  requireAdmin()
+  // 确定性假数据：按条目下标轮换结局，覆盖 401 通 / 403 被拒 / 429 限速 / 连不上四种语义
+  const items: Array<Record<string, unknown>> = []
+  const staticOutcomes = [
+    { reachable: true, status_code: 401, detail: '通', exit_ip: '203.0.113.10', country: '美国', cf_colo: 'SJC', warning: null },
+    { reachable: true, status_code: 401, detail: '通', exit_ip: '198.51.100.23', country: '日本', cf_colo: 'NRT', warning: '疑似放错池：静态条目实际是轮换（两次采样出口地址不同）' },
+    { reachable: true, status_code: 429, detail: '429 被限速', exit_ip: '192.0.2.77', country: '新加坡', cf_colo: 'SIN', warning: null },
+    { reachable: false, status_code: null, detail: '连不上（连接超时）', exit_ip: null, country: null, cf_colo: null, warning: null },
+  ]
+  mockTurnStateScope.probe_proxies.forEach((proxy, index) => {
+    items.push({ proxy, pool: 'static', ...staticOutcomes[index % staticOutcomes.length] })
+  })
+  const rotatingOutcomes = [
+    { reachable: true, status_code: 401, detail: '通', exit_ip: '172.68.141.202', country: '英国', cf_colo: 'LHR', warning: null },
+    { reachable: true, status_code: 403, detail: '403 出口被拒', exit_ip: '172.68.22.91', country: '德国', cf_colo: 'FRA', warning: null },
+    { reachable: false, status_code: null, detail: '连不上（TLS 握手失败）', exit_ip: null, country: null, cf_colo: null, warning: null },
+  ]
+  mockTurnStateScope.probe_proxies_rotating.forEach((proxy, index) => {
+    items.push({ proxy, pool: 'rotating', ...rotatingOutcomes[index % rotatingOutcomes.length] })
+  })
+  return createMockResponse(items)
+})
+
+registerDynamicRoute('PUT', '/api/admin/modules/codex-turn-state/dry-run', async (config) => {
+  await delay()
+  requireAdmin()
+  const body = JSON.parse(config.data || '{}') as { dry_run?: boolean }
+  mockTurnStateRuntime.dry_run = body.dry_run === true
+  return createMockResponse({ dry_run: mockTurnStateRuntime.dry_run })
+})
+
+registerDynamicRoute('POST', '/api/admin/modules/codex-turn-state/clear', async () => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({ cleared: clearMockTurnStateBuckets() })
+})
+
+registerDynamicRoute('GET', '/api/admin/modules/codex-turn-state/config', async () => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({ ...mockTurnStateConfig })
+})
+
+registerDynamicRoute('PUT', '/api/admin/modules/codex-turn-state/config', async (config) => {
+  await delay()
+  requireAdmin()
+  const body = JSON.parse(config.data || '{}') as Partial<typeof mockTurnStateConfig>
+  // 长度指纹与 TTL 变了，已采的桶全部作废：与真实后端行为一致，保存即清桶
+  const fingerprintChanged =
+    (typeof body.ttl_seconds === 'number' && body.ttl_seconds !== mockTurnStateConfig.ttl_seconds) ||
+    (typeof body.template_length === 'number' && body.template_length !== mockTurnStateConfig.template_length) ||
+    (typeof body.replace_length === 'number' && body.replace_length !== mockTurnStateConfig.replace_length)
+  Object.assign(mockTurnStateConfig, body)
+  if (fingerprintChanged) clearMockTurnStateBuckets()
+  return createMockResponse({ ...mockTurnStateConfig })
 })
 
 // Provider 详情

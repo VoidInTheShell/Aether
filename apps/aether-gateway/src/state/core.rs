@@ -403,6 +403,7 @@ impl AppState {
             scheduler_affinity_epoch: Arc::new(AtomicU64::new(0)),
             dashboard_response_cache: Arc::new(DashboardResponseCache::default()),
             system_config_cache: Arc::new(SystemConfigCache::default()),
+            codex_turn_state: Arc::new(super::TurnStateRuntime::new()),
             endpoint_response_header_rules_cache: Arc::new(JsonValueCache::default()),
             candidate_row_page_cache: Arc::new(crate::cache::CandidateRowPageCache::default()),
             candidate_page_cache: Arc::new(crate::cache::CandidatePageCache::default()),
@@ -2201,6 +2202,8 @@ impl AppState {
 
     pub fn spawn_background_tasks(&self) -> crate::task_runtime::TaskSupervisor {
         let background_state = self.background_worker_state();
+        self.codex_turn_state
+            .spawn_renewal_worker(background_state.clone());
         let mut supervisor =
             crate::task_runtime::TaskSupervisor::with_metrics(self.task_supervisor_metrics.clone());
         let record_boot = |task_key: &'static str| {

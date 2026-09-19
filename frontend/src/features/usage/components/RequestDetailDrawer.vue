@@ -1618,6 +1618,7 @@ const headerModelRecord = computed(() => {
     ),
     reasoning_effort: resolveHeaderModelTextField('reasoning_effort', currentDetail),
     service_tier: resolveHeaderModelTextField('service_tier', currentDetail),
+    turn_state_verdict: resolveHeaderModelTextField('turn_state_verdict', currentDetail),
     error_message: errorMessage,
   }
 })

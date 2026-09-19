@@ -17,6 +17,7 @@ mod routing_profiles;
 mod runtime;
 #[cfg(test)]
 mod testing;
+mod turn_state;
 mod types;
 mod video;
 
@@ -49,6 +50,7 @@ pub(crate) use self::proxy::{
     decrypt_or_migrate_proxy_tunnel_psk, decrypt_or_migrate_proxy_tunnel_psk_binding,
     unavailable_proxy_snapshot,
 };
+pub(crate) use self::turn_state::{TurnStateConfig, TurnStateRuntime, TurnStateScope};
 pub(crate) use self::types::{
     AdminWalletMutationOutcome, GatewayAdminPaymentCallbackView, GatewayUserPreferenceView,
     GatewayUserSessionView, LocalExecutionRuntimeMissDiagnostic, LocalMutationOutcome,

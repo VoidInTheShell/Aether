@@ -94,6 +94,9 @@ pub fn sanitize_usage_request_metadata_object(source: &Map<String, Value>) -> Op
     ] {
         insert_known_string(source, &mut target, key, sanitize_service_tier);
     }
+    for key in ["turn_state_verdict", "turn_state_action"] {
+        insert_known_string(source, &mut target, key, sanitize_turn_state_value);
+    }
     insert_bounded_u64(
         source,
         &mut target,
@@ -352,6 +355,19 @@ fn sanitize_service_tier(value: &str) -> Option<String> {
             "standard",
         ],
     )
+}
+
+fn sanitize_turn_state_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 32
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_lowercase() || character == '_' || character == '-')
+    {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 fn known_lowercase(value: &str, allowed: &[&str]) -> Option<String> {

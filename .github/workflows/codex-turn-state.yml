@@ -1,0 +1,151 @@
+name: Codex Turn-State Feature Build
+
+on:
+  push:
+    branches:
+      - feat/codex-turn-state-260919
+  workflow_dispatch:
+
+concurrency:
+  group: codex-turn-state-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  rust_ci:
+    name: Rust CI
+    uses: ./.github/workflows/rust-ci.yml
+
+  build:
+    name: Build amd64 image
+    needs: rust_ci
+    if: ${{ needs.rust_ci.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      tag: ${{ steps.image.outputs.tag }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.95.0
+          targets: x86_64-unknown-linux-musl
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: codex-turn-state-x86_64-unknown-linux-musl
+          workspaces: . -> target
+
+      - name: Install cross
+        uses: taiki-e/install-action@1ae7257be536a92d9218a6b343dc6e6ba650f7e1 # cross
+
+      - name: Build gateway binary
+        env:
+          AETHER_BUILD_VERSION: codex-turn-state-${{ github.sha }}
+          AETHER_VERSION: codex-turn-state
+          AETHER_BUILD_TYPE: release
+        run: cross build --release --locked -p aether-gateway --target x86_64-unknown-linux-musl
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            aether-vscodex/web/package-lock.json
+
+      - name: Install VSCodex web dependencies
+        working-directory: aether-vscodex/web
+        run: npm ci
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          AETHER_BUILD_VERSION: codex-turn-state-${{ github.sha }}
+          AETHER_VERSION: codex-turn-state
+        run: npm run build
+
+      - name: Prepare Docker build context
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/frontend
+          cp target/x86_64-unknown-linux-musl/release/aether-gateway dist/aether-gateway-amd64
+          chmod 0755 dist/aether-gateway-amd64
+          cp -R frontend/dist/. dist/frontend/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image coordinates
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
+          owner="${owner,,}"
+          image="ghcr.io/${owner}/aether"
+          tag="codex-turn-state-${GITHUB_SHA}"
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push amd64 image
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile.app
+          push: true
+          platforms: linux/amd64
+          cache-from: type=registry,ref=${{ steps.image.outputs.image }}:buildcache
+          cache-to: type=registry,ref=${{ steps.image.outputs.image }}:buildcache,mode=max
+          tags: |
+            ${{ steps.image.outputs.image }}:${{ steps.image.outputs.tag }}
+            ${{ steps.image.outputs.image }}:codex-turn-state
+          labels: |
+            org.opencontainers.image.title=Aether
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Write image digest summary
+        shell: bash
+        run: |
+          {
+            echo "### Codex Turn-State image"
+            echo
+            echo "- image: \`${{ steps.image.outputs.image }}:${{ steps.image.outputs.tag }}\`"
+            echo "- digest: \`${{ steps.push.outputs.digest }}\`"
+            echo "- revision: \`${GITHUB_SHA}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"

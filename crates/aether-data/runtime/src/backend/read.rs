@@ -11,6 +11,7 @@ use crate::repository::background_tasks::BackgroundTaskReadRepository;
 use crate::repository::billing::BillingReadRepository;
 use crate::repository::candidate_selection::MinimalCandidateSelectionReadRepository;
 use crate::repository::candidates::RequestCandidateReadRepository;
+use crate::repository::codex_turn_state::CodexTurnStateBucketReadRepository;
 use crate::repository::gemini_file_mappings::GeminiFileMappingReadRepository;
 use crate::repository::global_models::GlobalModelReadRepository;
 use crate::repository::management_tokens::ManagementTokenReadRepository;
@@ -41,6 +42,7 @@ pub struct DataReadRepositories {
     proxy_nodes: Option<Arc<dyn ProxyNodeReadRepository>>,
     minimal_candidate_selection: Option<Arc<dyn MinimalCandidateSelectionReadRepository>>,
     request_candidates: Option<Arc<dyn RequestCandidateReadRepository>>,
+    codex_turn_state_buckets: Option<Arc<dyn CodexTurnStateBucketReadRepository>>,
     provider_catalog: Option<Arc<dyn ProviderCatalogReadRepository>>,
     provider_quotas: Option<Arc<dyn ProviderQuotaReadRepository>>,
     routing_groups: Option<Arc<dyn RoutingGroupReadRepository>>,
@@ -73,6 +75,10 @@ impl fmt::Debug for DataReadRepositories {
                 &self.minimal_candidate_selection.is_some(),
             )
             .field("has_request_candidates", &self.request_candidates.is_some())
+            .field(
+                "has_codex_turn_state_buckets",
+                &self.codex_turn_state_buckets.is_some(),
+            )
             .field("has_provider_catalog", &self.provider_catalog.is_some())
             .field("has_provider_quotas", &self.provider_quotas.is_some())
             .field("has_routing_groups", &self.routing_groups.is_some())
@@ -144,6 +150,11 @@ impl DataReadRepositories {
         if self.request_candidates.is_none() {
             self.request_candidates =
                 Some(PostgresBackend::request_candidate_read_repository(backend));
+        }
+        if self.codex_turn_state_buckets.is_none() {
+            self.codex_turn_state_buckets = Some(
+                PostgresBackend::codex_turn_state_bucket_read_repository(backend),
+            );
         }
         if self.provider_catalog.is_none() {
             self.provider_catalog =
@@ -233,6 +244,10 @@ impl DataReadRepositories {
         self.request_candidates.clone()
     }
 
+    pub fn codex_turn_state_buckets(&self) -> Option<Arc<dyn CodexTurnStateBucketReadRepository>> {
+        self.codex_turn_state_buckets.clone()
+    }
+
     pub fn provider_catalog(&self) -> Option<Arc<dyn ProviderCatalogReadRepository>> {
         self.provider_catalog.clone()
     }
@@ -276,6 +291,7 @@ impl DataReadRepositories {
             || self.proxy_nodes.is_some()
             || self.minimal_candidate_selection.is_some()
             || self.request_candidates.is_some()
+            || self.codex_turn_state_buckets.is_some()
             || self.provider_catalog.is_some()
             || self.provider_quotas.is_some()
             || self.routing_groups.is_some()

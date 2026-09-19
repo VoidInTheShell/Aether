@@ -6,6 +6,7 @@ pub mod background_tasks;
 pub mod billing;
 pub mod candidate_selection;
 pub mod candidates;
+pub mod codex_turn_state;
 pub mod gemini_file_mappings;
 pub mod global_models;
 pub mod management_tokens;

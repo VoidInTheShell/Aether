@@ -287,6 +287,7 @@ dependencies = [
  "aether-task-runtime",
  "aether-test-support",
  "aether-testkit",
+ "aether-turn-state",
  "aether-usage-runtime",
  "aether-video-tasks-core",
  "aether-wallet",
@@ -664,6 +665,15 @@ dependencies = [
  "http",
  "sqlx",
  "tokio",
+]
+
+[[package]]
+name = "aether-turn-state"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -568,6 +568,25 @@ async fn apply_local_sync_report_effect(state: &AppState, payload: &GatewaySyncR
                 "gateway failed to persist codex realtime quota from sync response headers"
             );
         }
+        if let Err(err) = state
+            .codex_turn_state
+            .harvest_response_headers(
+                state,
+                payload.report_context.as_ref(),
+                &payload.headers,
+                "passive",
+            )
+            .await
+        {
+            warn!(
+                event_name = "codex_turn_state_harvest_failed",
+                log_type = "ops",
+                report_kind = %payload.report_kind,
+                report_request_id = %short_request_id(report_request_id(payload.report_context.as_ref())),
+                error = ?err,
+                "gateway failed to harvest Codex turn-state from sync response headers"
+            );
+        }
     }
     if let Err(err) = sync_grok_quota_from_report_context(
         state,
@@ -638,6 +657,27 @@ async fn apply_local_stream_report_effect(state: &AppState, payload: &GatewayStr
                 report_request_id = %short_request_id(report_request_id(payload.report_context.as_ref())),
                 error = ?err,
                 "gateway failed to persist codex realtime quota from stream response headers"
+            );
+        }
+    }
+    if (200..300).contains(&payload.status_code) {
+        if let Err(err) = state
+            .codex_turn_state
+            .harvest_response_headers(
+                state,
+                payload.report_context.as_ref(),
+                &payload.headers,
+                "passive",
+            )
+            .await
+        {
+            warn!(
+                event_name = "codex_turn_state_harvest_failed",
+                log_type = "ops",
+                report_kind = %payload.report_kind,
+                report_request_id = %short_request_id(report_request_id(payload.report_context.as_ref())),
+                error = ?err,
+                "gateway failed to harvest Codex turn-state from stream response headers"
             );
         }
     }
