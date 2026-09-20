@@ -1433,24 +1433,44 @@ async fn proxy_request_inner(
         ));
     }
     let request_context_started_at = Instant::now();
+    // Box the context-resolution futures as trait objects so the surrounding
+    // handler future does not need to generalize the `&Method`/`&str` borrows
+    // held across their awaits (works around rustc's "implementation of
+    // `Send` is not general enough" inference failure).
     let mut request_context = if trusted_affinity_auth {
-        crate::control::resolve_public_request_context_with_trusted_auth(
-            &state,
-            &parts.method,
-            &parts.uri,
-            &parts.headers,
-            &trace_id,
-        )
-        .await?
+        let resolving: std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<GatewayPublicRequestContext, GatewayError>>
+                    + Send
+                    + '_,
+            >,
+        > = Box::pin(
+            crate::control::resolve_public_request_context_with_trusted_auth(
+                &state,
+                &parts.method,
+                &parts.uri,
+                &parts.headers,
+                &trace_id,
+            ),
+        );
+        resolving.await?
     } else {
-        crate::control::resolve_public_request_context_without_trusted_auth(
-            &state,
-            &parts.method,
-            &parts.uri,
-            &parts.headers,
-            &trace_id,
-        )
-        .await?
+        let resolving: std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<GatewayPublicRequestContext, GatewayError>>
+                    + Send
+                    + '_,
+            >,
+        > = Box::pin(
+            crate::control::resolve_public_request_context_without_trusted_auth(
+                &state,
+                &parts.method,
+                &parts.uri,
+                &parts.headers,
+                &trace_id,
+            ),
+        );
+        resolving.await?
     };
     request_context.client_ip = Some(client_ip.to_string());
     maybe_promote_management_token_admin_principal(
