@@ -15,7 +15,6 @@ use aether_turn_state::{
     DecisionAction, InjectMode, LiveTemplate, TurnStateDecisionInput, VerdictTransition,
     DEFAULT_REPLACE_LENGTH, DEFAULT_TEMPLATE_LENGTH, DEFAULT_TTL_SECONDS,
 };
-use axum::http;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -818,13 +817,13 @@ impl TurnStateRuntime {
                 .into_iter()
                 .map(|key| key.id)
                 .collect::<std::collections::BTreeSet<_>>();
-            if let Some(missing) = requested.iter().find(|key_id| !known.contains(*key_id)) {
-                return Err(GatewayError::Client {
-                    status: http::StatusCode::BAD_REQUEST,
-                    message: format!("探测范围包含不存在的号池 Key: {missing}"),
-                });
-            }
-            scope.key_ids = requested.into_iter().collect();
+            // 号池删除重建后 key_id 会变化，旧 key 静默丢弃而不是 400，
+            // 否则探测范围永远保存不进去、模块卡死。
+            scope.key_ids = requested
+                .iter()
+                .filter(|key_id| known.contains(*key_id))
+                .cloned()
+                .collect();
         }
         let value = serde_json::to_value(&scope).map_err(|err| {
             GatewayError::Internal(format!("turn-state scope encode failed: {err}"))

@@ -159,7 +159,7 @@
           v-if="!loading && !accounts.length"
           class="rounded-xl border border-dashed border-border px-4 py-8 text-center text-sm text-muted-foreground"
         >
-          暂无账号数据——先在「探测范围」勾选账号并跑一轮探测。
+          暂无账号数据——先在「账号与模型」导入并勾选账号，再跑一轮探测。
         </div>
         <div
           v-else
@@ -312,7 +312,7 @@
             还没有任何桶
           </p>
           <p class="mt-2 text-sm text-muted-foreground">
-            先到下方「探测范围」勾选账号和模型并保存，再回顶部点「开始探测」；开启被动采集后业务流量也会自动补桶。
+            先到下方「账号与模型」勾选账号和模型并保存，再回顶部点「开始探测」；开启被动采集后业务流量也会自动补桶。
           </p>
         </div>
         <div
@@ -445,18 +445,30 @@
         />
       </CardSection>
 
-      <!-- 探测范围 -->
+      <!-- 账号与模型 -->
       <CardSection
-        title="探测范围"
-        description="勾账号、勾模型、填代理池。改了范围不用重启，续期循环每分钟重读一次。范围不是白名单：业务替换只看桶里有没有未过期的正常态。"
+        title="账号与模型"
+        description="点「导入号池账号」拉取类型为 codex 的供应商号池账号，手动勾选参与探测的账号与模型。改了范围不用重启，续期循环每分钟重读一次。范围不是白名单：业务替换只看桶里有没有未过期的正常态。"
       >
         <template #actions>
           <Button
+            variant="outline"
             size="sm"
-            :disabled="loading || scopeSaving || !hasScopeChanges"
-            @click="saveScope"
+            :disabled="loading || importingKeys"
+            @click="importPoolKeys()"
           >
-            {{ scopeSaving ? '保存中...' : '保存探测范围' }}
+            <Download
+              class="mr-2 h-4 w-4"
+              :class="{ 'animate-pulse': importingKeys }"
+            />
+            {{ importingKeys ? '导入中...' : '导入号池账号' }}
+          </Button>
+          <Button
+            size="sm"
+            :disabled="loading || accountSaving || !accountCardDirty"
+            @click="saveAccountScope"
+          >
+            {{ accountSaving ? '保存中...' : '保存账号与模型' }}
           </Button>
         </template>
 
@@ -467,7 +479,7 @@
             </p>
             <div class="space-y-2 rounded-xl border border-border p-3">
               <label
-                v-for="key in availableKeys"
+                v-for="key in pagedScopeKeys"
                 :key="key.key_id"
                 class="flex cursor-pointer items-center gap-3 rounded-lg px-2 py-1.5 hover:bg-muted/50"
               >
@@ -479,16 +491,41 @@
                   <span class="block truncate text-sm text-foreground">{{ key.key_name }}</span>
                   <span class="block truncate font-mono text-[11px] text-muted-foreground">{{ key.key_id }}</span>
                 </span>
+                <Badge
+                  v-if="key.provider_name && showKeyProviderName"
+                  variant="outline"
+                  class="shrink-0 text-[10px]"
+                >
+                  {{ key.provider_name }}
+                </Badge>
+                <Badge
+                  v-if="key.missing"
+                  variant="destructive"
+                  class="shrink-0 text-[10px]"
+                >
+                  号池已删除
+                </Badge>
               </label>
               <p
                 v-if="!availableKeys.length"
                 class="px-2 py-3 text-sm text-muted-foreground"
               >
-                号池中没有 Codex 账号
+                {{ keysImported ? 'codex 号池里没有账号' : '点右上角「导入号池账号」拉取 codex 号池账号' }}
               </p>
             </div>
+            <Pagination
+              v-if="availableKeys.length"
+              :current="scopeKeyPage"
+              :total="availableKeys.length"
+              :page-size="scopeKeyPageSize"
+              cache-key="turn-state-scope-keys-page-size"
+              @update:current="scopeKeyPage = $event"
+              @update:page-size="scopeKeyPageSize = $event"
+            />
+          </div>
 
-            <p class="pt-2 text-sm font-medium text-foreground">
+          <div class="space-y-3">
+            <p class="text-sm font-medium text-foreground">
               模型（{{ scope.models.length }}）
             </p>
             <div class="flex flex-wrap gap-2">
@@ -527,57 +564,73 @@
               可勾选已有模型，也可手动添加。必须是带横线的上游官方模型名（如 gpt-5.5-codex），别名无效。
             </p>
           </div>
+        </div>
+      </CardSection>
 
-          <div class="space-y-4">
-            <div>
-              <div class="mb-1.5 flex items-baseline justify-between">
-                <p class="text-sm font-medium text-foreground">
-                  静态出口池（{{ staticProxyLines.length }} 条）
-                </p>
-                <p class="text-[11px] text-muted-foreground">
-                  一条 URL = 一个固定 IP，每桶每条 55 分钟一次机会
-                </p>
-              </div>
-              <Textarea
-                v-model="staticProxyText"
-                rows="5"
-                class="font-mono text-xs"
-                placeholder="socks5://user:pass@host:port&#10;http://user:pass@host:port"
-              />
-              <p
-                v-if="invalidStaticLines.length"
-                class="mt-1.5 text-[11px] text-destructive"
-              >
-                第 {{ invalidStaticLines.join('、') }} 行格式不对：需以 http://、https:// 或 socks5:// 开头
+      <!-- 代理配置 -->
+      <CardSection
+        title="代理配置"
+        description="主动探测用的出口池。改了不用重启，续期循环每分钟重读一次。放错池子是静默的，用下方「代理连通性检查」核对。"
+      >
+        <template #actions>
+          <Button
+            size="sm"
+            :disabled="loading || proxySaving || !proxyCardDirty"
+            @click="saveProxyScope"
+          >
+            {{ proxySaving ? '保存中...' : '保存代理配置' }}
+          </Button>
+        </template>
+
+        <div class="grid gap-6 lg:grid-cols-2">
+          <div>
+            <div class="mb-1.5 flex items-baseline justify-between">
+              <p class="text-sm font-medium text-foreground">
+                静态出口池（{{ staticProxyLines.length }} 条）
+              </p>
+              <p class="text-[11px] text-muted-foreground">
+                一条 URL = 一个固定 IP，每桶每条 55 分钟一次机会
               </p>
             </div>
-            <div>
-              <div class="mb-1.5 flex items-baseline justify-between">
-                <p class="text-sm font-medium text-foreground">
-                  轮换出口池（{{ rotatingProxyLines.length }} 条）
-                </p>
-                <p class="text-[11px] text-muted-foreground">
-                  一条 URL = 住宅网关，每次连接换地址
-                </p>
-              </div>
-              <Textarea
-                v-model="rotatingProxyText"
-                rows="5"
-                class="font-mono text-xs"
-                placeholder="socks5h://user:pass@gw.example:7000"
-              />
-              <p
-                v-if="invalidRotatingLines.length"
-                class="mt-1.5 text-[11px] text-destructive"
-              >
-                第 {{ invalidRotatingLines.join('、') }} 行格式不对：需以 http://、https:// 或 socks5:// 开头
-              </p>
-            </div>
-            <p class="text-[11px] leading-5 text-muted-foreground">
-              格式 <code class="rounded bg-muted px-1">scheme://用户:密码@主机:端口</code>，scheme ∈ socks5 / socks5h / http / https，必须带 scheme。
-              静态池优先——静态额度会过期，先花会过期的那份。放错池子是静默的，用下方「代理连通性检查」核对。
+            <Textarea
+              v-model="staticProxyText"
+              rows="5"
+              class="font-mono text-xs"
+              placeholder="socks5://user:pass@host:port&#10;http://user:pass@host:port"
+            />
+            <p
+              v-if="invalidStaticLines.length"
+              class="mt-1.5 text-[11px] text-destructive"
+            >
+              第 {{ invalidStaticLines.join('、') }} 行格式不对：需以 http://、https:// 或 socks5:// 开头
             </p>
           </div>
+          <div>
+            <div class="mb-1.5 flex items-baseline justify-between">
+              <p class="text-sm font-medium text-foreground">
+                轮换出口池（{{ rotatingProxyLines.length }} 条）
+              </p>
+              <p class="text-[11px] text-muted-foreground">
+                一条 URL = 住宅网关，每次连接换地址
+              </p>
+            </div>
+            <Textarea
+              v-model="rotatingProxyText"
+              rows="5"
+              class="font-mono text-xs"
+              placeholder="socks5h://user:pass@gw.example:7000"
+            />
+            <p
+              v-if="invalidRotatingLines.length"
+              class="mt-1.5 text-[11px] text-destructive"
+            >
+              第 {{ invalidRotatingLines.join('、') }} 行格式不对：需以 http://、https:// 或 socks5:// 开头
+            </p>
+          </div>
+          <p class="text-[11px] leading-5 text-muted-foreground lg:col-span-2">
+            格式 <code class="rounded bg-muted px-1">scheme://用户:密码@主机:端口</code>，scheme ∈ socks5 / socks5h / http / https，必须带 scheme。
+            静态池优先——静态额度会过期，先花会过期的那份。
+          </p>
         </div>
       </CardSection>
 
@@ -846,7 +899,7 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { AlertTriangle, ChevronDown, Network, Play, Plus, Recycle, RefreshCw, Square, Trash2 } from 'lucide-vue-next'
+import { AlertTriangle, ChevronDown, Download, Network, Play, Plus, Recycle, RefreshCw, Square, Trash2 } from 'lucide-vue-next'
 import { PageContainer, PageHeader, CardSection } from '@/components/layout'
 import Badge from '@/components/ui/badge.vue'
 import Button from '@/components/ui/button.vue'
@@ -870,6 +923,7 @@ import {
   type TurnStateScope,
   type TurnStateStatus,
 } from '@/api/codex-turn-state'
+import { getPoolOverview, listPoolKeys } from '@/api/endpoints/pool'
 import { useModuleStore } from '@/stores/modules'
 import { useConfirm } from '@/composables/useConfirm'
 import { useToast } from '@/composables/useToast'
@@ -954,7 +1008,13 @@ const checkingProxies = ref(false)
 const clearing = ref(false)
 const dryRunSaving = ref(false)
 const moduleToggling = ref(false)
-const scopeSaving = ref(false)
+const scopeKeyPage = ref(1)
+const scopeKeyPageSize = ref(10)
+const accountSaving = ref(false)
+const proxySaving = ref(false)
+const importingKeys = ref(false)
+const keysImported = ref(false)
+const importedKeys = ref<Array<{ key_id: string; key_name: string; provider_name: string | null }>>([])
 const probeActionPending = ref(false)
 const advancedOpen = ref(false)
 
@@ -1029,14 +1089,35 @@ const counterItems = computed(() => {
   ]
 })
 
-/** 可选账号 = 桶矩阵里出现过的号池 Codex 账号 ∪ 已保存范围 */
+/** 可选账号 = 导入的 codex 号池账号 ∪ 已保存范围（范围里没被导入命中的 = 号池删除重建后的残余） */
 const availableKeys = computed(() => {
-  const map = new Map<string, string>()
-  for (const bucket of buckets.value) map.set(bucket.key_id, bucket.key_name)
-  for (const keyId of scope.value.key_ids) {
-    if (!map.has(keyId)) map.set(keyId, keyId)
+  const map = new Map<string, { key_id: string; key_name: string; provider_name: string | null; missing: boolean }>()
+  for (const key of importedKeys.value) {
+    map.set(key.key_id, { key_id: key.key_id, key_name: key.key_name, provider_name: key.provider_name, missing: false })
   }
-  return [...map.entries()].map(([key_id, key_name]) => ({ key_id, key_name }))
+  for (const keyId of scope.value.key_ids) {
+    if (!map.has(keyId)) {
+      // 导入完成前无法区分"号池已删除"，只有导入过才能标残余
+      map.set(keyId, { key_id: keyId, key_name: keyId, provider_name: null, missing: keysImported.value })
+    }
+  }
+  return [...map.values()].sort((a, b) =>
+    Number(b.missing) - Number(a.missing)
+    || a.key_name.localeCompare(b.key_name)
+    || a.key_id.localeCompare(b.key_id))
+})
+
+/** 导入了多个 codex 供应商时才显示账号来源，单池不吵 */
+const showKeyProviderName = computed(() =>
+  new Set(importedKeys.value.map(key => key.provider_name)).size > 1)
+
+const pagedScopeKeys = computed(() => {
+  const start = (scopeKeyPage.value - 1) * scopeKeyPageSize.value
+  return availableKeys.value.slice(start, start + scopeKeyPageSize.value)
+})
+watch(() => availableKeys.value.length, (total) => {
+  const maxPage = Math.max(1, Math.ceil(total / scopeKeyPageSize.value))
+  if (scopeKeyPage.value > maxPage) scopeKeyPage.value = maxPage
 })
 
 /** 可选模型 = 桶矩阵 ∪ 已保存范围 */
@@ -1064,9 +1145,33 @@ function invalidProxyLineNumbers(text: string): number[] {
 const invalidStaticLines = computed(() => invalidProxyLineNumbers(staticProxyText.value))
 const invalidRotatingLines = computed(() => invalidProxyLineNumbers(rotatingProxyText.value))
 
-const hasScopeChanges = computed(() => {
-  if (!originalScopeJson.value) return false
-  return JSON.stringify(currentScopePayload()) !== originalScopeJson.value
+const originalScope = computed<TurnStateScope | null>(() => {
+  if (!originalScopeJson.value) return null
+  try {
+    return JSON.parse(originalScopeJson.value) as TurnStateScope
+  } catch {
+    return null
+  }
+})
+
+function sameStringList(left: string[], right: string[]): boolean {
+  return JSON.stringify([...left].sort()) === JSON.stringify([...right].sort())
+}
+
+/** 账号与模型卡的脏检查：只看 key_ids / models */
+const accountCardDirty = computed(() => {
+  const original = originalScope.value
+  if (!original) return false
+  return !sameStringList(scope.value.key_ids, original.key_ids ?? [])
+    || !sameStringList(scope.value.models, original.models ?? [])
+})
+
+/** 代理配置卡的脏检查：只看两个出口池 */
+const proxyCardDirty = computed(() => {
+  const original = originalScope.value
+  if (!original) return false
+  return !sameStringList(staticProxyLines.value, original.probe_proxies ?? [])
+    || !sameStringList(rotatingProxyLines.value, original.probe_proxies_rotating ?? [])
 })
 
 const hasConfigChanges = computed(() => {
@@ -1188,23 +1293,76 @@ async function loadAll() {
   }
 }
 
-async function saveScope() {
+function applySavedScope(saved: TurnStateScope) {
+  scope.value = { ...saved }
+  staticProxyText.value = saved.probe_proxies.join('\n')
+  rotatingProxyText.value = saved.probe_proxies_rotating.join('\n')
+  originalScopeJson.value = JSON.stringify(saved)
+}
+
+/** 导入 codex 号池账号：号池概览过滤 provider_type=codex，逐供应商拉全量 key */
+async function importPoolKeys(options: { silent?: boolean } = {}) {
+  importingKeys.value = true
+  try {
+    const overview = await getPoolOverview()
+    const codexProviders = overview.items.filter(item => item.provider_type === 'codex')
+    const collected: Array<{ key_id: string; key_name: string; provider_name: string | null }> = []
+    for (const provider of codexProviders) {
+      let page = 1
+      const pageSize = 100
+      let fetched = 0
+      // 页数上限 50（5000 条）兜底，防接口异常时死循环
+      while (page <= 50) {
+        const resp = await listPoolKeys(provider.provider_id, { page, page_size: pageSize })
+        for (const key of resp.keys) {
+          collected.push({ key_id: key.key_id, key_name: key.key_name, provider_name: provider.provider_name })
+        }
+        fetched += resp.keys.length
+        if (fetched >= resp.total || resp.keys.length < pageSize) break
+        page += 1
+      }
+    }
+    const dedup = new Map<string, { key_id: string; key_name: string; provider_name: string | null }>()
+    for (const item of collected) {
+      if (!dedup.has(item.key_id)) dedup.set(item.key_id, item)
+    }
+    importedKeys.value = [...dedup.values()]
+    keysImported.value = true
+    if (!options.silent) success(`已导入 ${importedKeys.value.length} 个 codex 号池账号`)
+  } catch (err) {
+    error(parseApiError(err, '导入号池账号失败'))
+  } finally {
+    importingKeys.value = false
+  }
+}
+
+async function saveAccountScope() {
+  accountSaving.value = true
+  try {
+    const saved = await codexTurnStateApi.updateScope(currentScopePayload())
+    applySavedScope(saved)
+    success('账号与模型已保存')
+  } catch (err) {
+    error(parseApiError(err, '保存账号与模型失败'))
+  } finally {
+    accountSaving.value = false
+  }
+}
+
+async function saveProxyScope() {
   if (invalidStaticLines.value.length || invalidRotatingLines.value.length) {
     error('代理池里有格式不对的行，先修正再保存')
     return
   }
-  scopeSaving.value = true
+  proxySaving.value = true
   try {
     const saved = await codexTurnStateApi.updateScope(currentScopePayload())
-    scope.value = { ...saved }
-    staticProxyText.value = saved.probe_proxies.join('\n')
-    rotatingProxyText.value = saved.probe_proxies_rotating.join('\n')
-    originalScopeJson.value = JSON.stringify(saved)
-    success('探测范围已保存')
+    applySavedScope(saved)
+    success('代理配置已保存')
   } catch (err) {
-    error(parseApiError(err, '保存探测范围失败'))
+    error(parseApiError(err, '保存代理配置失败'))
   } finally {
-    scopeSaving.value = false
+    proxySaving.value = false
   }
 }
 
@@ -1354,6 +1512,8 @@ function syncProbePolling() {
 
 onMounted(() => {
   loadAll()
+  // 静默预导入一次：让已保存范围的账号名直接可见，号池删除重建后的残余 key 立刻可标
+  importPoolKeys({ silent: true })
   ttlTicker = setInterval(() => {
     tickNow.value = Date.now()
   }, 1000)
