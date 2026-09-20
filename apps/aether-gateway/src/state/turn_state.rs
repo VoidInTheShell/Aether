@@ -453,7 +453,9 @@ impl AppState {
         self.data
             .delete_codex_turn_state_buckets_for_key(key_id)
             .await
-            .map_err(|err| GatewayError::Internal(format!("turn-state bucket delete failed: {err}")))
+            .map_err(|err| {
+                GatewayError::Internal(format!("turn-state bucket delete failed: {err}"))
+            })
     }
 }
 
@@ -538,9 +540,8 @@ impl TurnStateRuntime {
                                         .get(bucket_key(key_id, model).as_str())
                                         .map_or(true, |bucket| {
                                             bucket.expires_at_unix
-                                                <= now.saturating_add(
-                                                    config.renew_threshold_seconds,
-                                                )
+                                                <= now
+                                                    .saturating_add(config.renew_threshold_seconds)
                                         });
                                     if bucket_due {
                                         due.insert(key_id.to_string());
@@ -1569,7 +1570,11 @@ impl TurnStateRuntime {
                     // mark so a flaky network does not bench it for an hour.
                     self.set_exit_cooldown(
                         cooldown_key,
-                        now.saturating_add(config.exit_cooldown_seconds.min(config.network_cooldown_seconds)),
+                        now.saturating_add(
+                            config
+                                .exit_cooldown_seconds
+                                .min(config.network_cooldown_seconds),
+                        ),
                     )
                     .await;
                 }
@@ -1698,7 +1703,11 @@ impl TurnStateRuntime {
                     saw_non_degraded = true;
                     self.set_exit_cooldown(
                         cooldown_key,
-                        now.saturating_add(config.exit_cooldown_seconds.min(config.network_cooldown_seconds)),
+                        now.saturating_add(
+                            config
+                                .exit_cooldown_seconds
+                                .min(config.network_cooldown_seconds),
+                        ),
                     )
                     .await;
                 }
@@ -1982,30 +1991,78 @@ impl TurnStateRuntime {
         // Run checks concurrently under one shared deadline: a pool full of
         // dead proxies must not hold the admin request hostage for minutes
         // (the reference plugin used 6 workers with a 45s total budget).
+        // JoinSet keeps every check future 'static and out of the caller's
+        // async witness; a futures-util `buffered` stream here previously
+        // tripped rustc's "Send is not general enough" inference failure in
+        // the unrelated proxy handler.
         let concurrency = config.proxy_check_concurrency.max(1) as usize;
         let deadline = std::time::Instant::now()
             + Duration::from_secs(config.proxy_check_total_budget_seconds);
         let per_check_timeout = config.proxy_check_timeout_seconds;
-        let results = futures_util::stream::iter(targets.into_iter().map(|(pool, raw_proxy)| {
-            async move {
+        let mut results: Vec<Option<Value>> = Vec::new();
+        results.resize_with(targets.len(), || None);
+        let mut in_flight = tokio::task::JoinSet::new();
+        let mut next = 0usize;
+        loop {
+            while in_flight.len() < concurrency && next < targets.len() {
+                let (pool, raw_proxy) = targets[next].clone();
+                let index = next;
+                next += 1;
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
-                    return Self::proxy_check_budget_exceeded(pool, raw_proxy.as_str());
+                    results[index] =
+                        Some(Self::proxy_check_budget_exceeded(pool, raw_proxy.as_str()));
+                    continue;
                 }
-                match tokio::time::timeout(
-                    remaining,
-                    Self::proxy_check_one(pool, raw_proxy.clone(), per_check_timeout),
-                )
-                .await
-                {
-                    Ok(value) => value,
-                    Err(_) => Self::proxy_check_budget_exceeded(pool, raw_proxy.as_str()),
-                }
+                in_flight.spawn(async move {
+                    let value = match tokio::time::timeout(
+                        remaining,
+                        Self::proxy_check_one(pool, raw_proxy.clone(), per_check_timeout),
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(_) => Self::proxy_check_budget_exceeded(pool, raw_proxy.as_str()),
+                    };
+                    (index, value)
+                });
             }
-        }))
-        .buffered(concurrency)
-        .collect::<Vec<_>>()
-        .await;
+            if in_flight.is_empty() {
+                break;
+            }
+            match in_flight.join_next().await {
+                Some(Ok((index, value))) => results[index] = Some(value),
+                // A join error means the check task panicked; the slot keeps
+                // its fallback entry below.
+                Some(Err(_)) => {}
+                None => break,
+            }
+        }
+        let results = results
+            .into_iter()
+            .enumerate()
+            .map(|(index, slot)| {
+                slot.unwrap_or_else(|| {
+                    let (pool, raw_proxy) = &targets[index];
+                    let masked = if raw_proxy.is_empty() {
+                        "direct".to_string()
+                    } else {
+                        mask_proxy(raw_proxy)
+                    };
+                    json!({
+                        "proxy": masked,
+                        "pool": pool,
+                        "reachable": false,
+                        "status_code": null,
+                        "detail": "检查任务异常终止",
+                        "exit_ip": null,
+                        "country": null,
+                        "cf_colo": null,
+                        "warning": null
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
         Ok(Value::Array(results))
     }
 
@@ -2063,11 +2120,19 @@ impl TurnStateRuntime {
         let country = first_trace
             .as_ref()
             .and_then(|trace| trace.country.clone())
-            .or_else(|| second_trace.as_ref().and_then(|trace| trace.country.clone()));
+            .or_else(|| {
+                second_trace
+                    .as_ref()
+                    .and_then(|trace| trace.country.clone())
+            });
         let cf_colo = first_trace
             .as_ref()
             .and_then(|trace| trace.cf_colo.clone())
-            .or_else(|| second_trace.as_ref().and_then(|trace| trace.cf_colo.clone()));
+            .or_else(|| {
+                second_trace
+                    .as_ref()
+                    .and_then(|trace| trace.cf_colo.clone())
+            });
         let warning = if pool == "static" {
             static_trace_warning(first_trace.as_ref(), second_trace.as_ref())
         } else {
@@ -2512,9 +2577,7 @@ fn probe_jwt_account_id(token: &str) -> Option<String> {
         (Some(_), Some(payload), Some(_), None) => payload,
         _ => return None,
     };
-    let raw = URL_SAFE_NO_PAD
-        .decode(payload.trim_end_matches('='))
-        .ok()?;
+    let raw = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
     let claims: Value = serde_json::from_slice(&raw).ok()?;
     claims
         .get("https://api.openai.com/auth")?
