@@ -1361,6 +1361,12 @@ fn admin_usage_active_request_json(
     if let Some(actual_service_tier) = item.provider_actual_service_tier() {
         value["actual_service_tier"] = json!(actual_service_tier);
     }
+    if let Some(turn_state_verdict) = admin_usage_metadata_string(item, "turn_state_verdict") {
+        value["turn_state_verdict"] = json!(turn_state_verdict);
+    }
+    if let Some(turn_state_action) = admin_usage_metadata_string(item, "turn_state_action") {
+        value["turn_state_action"] = json!(turn_state_action);
+    }
     if let Some(image_progress) = image_progress {
         value["image_progress"] = image_progress.clone();
     }
@@ -1523,6 +1529,16 @@ pub fn admin_usage_record_json(
             json!(actual_service_tier),
         );
     }
+    maybe_insert_string_field(
+        object,
+        "turn_state_verdict",
+        admin_usage_metadata_string(item, "turn_state_verdict"),
+    );
+    maybe_insert_string_field(
+        object,
+        "turn_state_action",
+        admin_usage_metadata_string(item, "turn_state_action"),
+    );
     payload
 }
 

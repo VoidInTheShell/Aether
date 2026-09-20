@@ -941,6 +941,11 @@ const SENSITIVE_SYSTEM_CONFIG_KEYS: &[&str] = &[
     "module.server_chan_push.send_key",
     "module.important_notification.server_chan_send_key",
     "module.bark_push.device_key",
+    // Scope holds plaintext probe-proxy credentials; the runtime document holds
+    // encrypted bucket snapshots plus verdict state.  Neither may leave the
+    // process through the generic system-config API.
+    "module.codex_turn_state.scope",
+    "module.codex_turn_state.runtime",
 ];
 const ADMIN_API_FORMAT_DEFINITIONS: &[AdminApiFormatDefinition] = &[
     AdminApiFormatDefinition {
@@ -2328,6 +2333,12 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "module.codex_turn_state.exit_cooldown_seconds" => Some(json!(3300)),
         "module.codex_turn_state.rotating_max_attempts" => Some(json!(10)),
         "module.codex_turn_state.max_accounts_in_flight" => Some(json!(4)),
+        "module.codex_turn_state.rotating_cooldown_seconds" => Some(json!(600)),
+        "module.codex_turn_state.network_cooldown_seconds" => Some(json!(300)),
+        "module.codex_turn_state.probe_account_pace_seconds" => Some(json!(2)),
+        "module.codex_turn_state.proxy_check_timeout_seconds" => Some(json!(8)),
+        "module.codex_turn_state.proxy_check_concurrency" => Some(json!(6)),
+        "module.codex_turn_state.proxy_check_total_budget_seconds" => Some(json!(45)),
         "module.chat_pii_redaction.rules" => Some(chat_pii_redaction_default_rules()),
         "module.chat_pii_redaction.cache_ttl_seconds" => Some(json!(300)),
         "module.chat_pii_redaction.placeholder_prefix" => Some(json!("AETHER")),
@@ -2869,6 +2880,24 @@ pub fn parse_admin_system_config_update(
         }
         "module.codex_turn_state.max_accounts_in_flight" => {
             value = validate_codex_turn_state_u64(value, 1, 32, 4)?;
+        }
+        "module.codex_turn_state.rotating_cooldown_seconds" => {
+            value = validate_codex_turn_state_u64(value, 60, 86_400, 600)?;
+        }
+        "module.codex_turn_state.network_cooldown_seconds" => {
+            value = validate_codex_turn_state_u64(value, 30, 3_600, 300)?;
+        }
+        "module.codex_turn_state.probe_account_pace_seconds" => {
+            value = validate_codex_turn_state_u64(value, 1, 60, 2)?;
+        }
+        "module.codex_turn_state.proxy_check_timeout_seconds" => {
+            value = validate_codex_turn_state_u64(value, 2, 60, 8)?;
+        }
+        "module.codex_turn_state.proxy_check_concurrency" => {
+            value = validate_codex_turn_state_u64(value, 1, 16, 6)?;
+        }
+        "module.codex_turn_state.proxy_check_total_budget_seconds" => {
+            value = validate_codex_turn_state_u64(value, 10, 300, 45)?;
         }
         "module.important_notification.email_recipients" => {
             value = normalize_string_list_config_value(value).map_err(|_| {

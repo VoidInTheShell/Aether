@@ -16,6 +16,7 @@ use aether_turn_state::{
     DEFAULT_REPLACE_LENGTH, DEFAULT_TEMPLATE_LENGTH, DEFAULT_TTL_SECONDS,
 };
 use axum::http;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -37,6 +38,9 @@ const TURN_STATE_RUNTIME_KEY: &str = "module.codex_turn_state.runtime";
 const TURN_STATE_DESCRIPTION: &str = "Codex Turn-State runtime state (encrypted bucket values)";
 const TURN_STATE_PROBE_LOCK_KEY: &str = "codex_turn_state:probe";
 const TURN_STATE_PROBE_LOCK_TTL: Duration = Duration::from_secs(60 * 60);
+/// A probe must be indistinguishable from ordinary codex-tui traffic: a
+/// self-identifying user-agent invites risk-control divergence upstream.
+const PROBE_USER_AGENT: &str = "codex-tui/0.154.0 (Ubuntu 24.04; x86_64) OVH (codex-tui; 0.154.0)";
 const TURN_STATE_CONFIG_FIELDS: &[(&str, &str)] = &[
     ("inject_mode", "module.codex_turn_state.inject_mode"),
     ("harvest_inband", "module.codex_turn_state.harvest_inband"),
@@ -69,6 +73,30 @@ const TURN_STATE_CONFIG_FIELDS: &[(&str, &str)] = &[
         "max_accounts_in_flight",
         "module.codex_turn_state.max_accounts_in_flight",
     ),
+    (
+        "rotating_cooldown_seconds",
+        "module.codex_turn_state.rotating_cooldown_seconds",
+    ),
+    (
+        "network_cooldown_seconds",
+        "module.codex_turn_state.network_cooldown_seconds",
+    ),
+    (
+        "probe_account_pace_seconds",
+        "module.codex_turn_state.probe_account_pace_seconds",
+    ),
+    (
+        "proxy_check_timeout_seconds",
+        "module.codex_turn_state.proxy_check_timeout_seconds",
+    ),
+    (
+        "proxy_check_concurrency",
+        "module.codex_turn_state.proxy_check_concurrency",
+    ),
+    (
+        "proxy_check_total_budget_seconds",
+        "module.codex_turn_state.proxy_check_total_budget_seconds",
+    ),
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +123,12 @@ pub(crate) struct TurnStateConfig {
     pub exit_cooldown_seconds: u64,
     pub rotating_max_attempts: u32,
     pub max_accounts_in_flight: u32,
+    pub rotating_cooldown_seconds: u64,
+    pub network_cooldown_seconds: u64,
+    pub probe_account_pace_seconds: u64,
+    pub proxy_check_timeout_seconds: u64,
+    pub proxy_check_concurrency: u32,
+    pub proxy_check_total_budget_seconds: u64,
 }
 
 impl Default for TurnStateConfig {
@@ -115,6 +149,12 @@ impl Default for TurnStateConfig {
             exit_cooldown_seconds: 3300,
             rotating_max_attempts: 10,
             max_accounts_in_flight: 4,
+            rotating_cooldown_seconds: 600,
+            network_cooldown_seconds: 300,
+            probe_account_pace_seconds: 2,
+            proxy_check_timeout_seconds: 8,
+            proxy_check_concurrency: 6,
+            proxy_check_total_budget_seconds: 45,
         }
     }
 }
@@ -151,6 +191,24 @@ impl TurnStateConfig {
             || !(1..=32).contains(&self.max_accounts_in_flight)
         {
             return Err("probe concurrency settings are outside the allowed range".to_string());
+        }
+        if !(60..=86_400).contains(&self.rotating_cooldown_seconds) {
+            return Err("rotating_cooldown_seconds must be between 60 and 86400".to_string());
+        }
+        if !(30..=3_600).contains(&self.network_cooldown_seconds) {
+            return Err("network_cooldown_seconds must be between 30 and 3600".to_string());
+        }
+        if !(1..=60).contains(&self.probe_account_pace_seconds) {
+            return Err("probe_account_pace_seconds must be between 1 and 60".to_string());
+        }
+        if !(2..=60).contains(&self.proxy_check_timeout_seconds) {
+            return Err("proxy_check_timeout_seconds must be between 2 and 60".to_string());
+        }
+        if !(1..=16).contains(&self.proxy_check_concurrency) {
+            return Err("proxy_check_concurrency must be between 1 and 16".to_string());
+        }
+        if !(10..=300).contains(&self.proxy_check_total_budget_seconds) {
+            return Err("proxy_check_total_budget_seconds must be between 10 and 300".to_string());
         }
         Ok(())
     }
@@ -265,6 +323,9 @@ struct RuntimeMemory {
     account_backoff_until: BTreeMap<String, u64>,
     exit_cooldowns_until: BTreeMap<String, u64>,
     rotating_cooldowns_until: BTreeMap<String, u64>,
+    /// Per-account timestamp of the last upstream probe call.  Memory-only by
+    /// design: a restart may cost one early call, never a correctness bug.
+    account_last_fired_unix: BTreeMap<String, u64>,
     counters: Counters,
     probe_run: ProbeRun,
 }
@@ -342,6 +403,9 @@ pub(crate) enum TurnStateHarvestResult {
 pub(crate) struct TurnStateRuntime {
     loaded: AtomicBool,
     renewal_worker_started: AtomicBool,
+    /// Set when in-memory counters have advanced past the last persisted
+    /// snapshot; the renewal loop flushes them once per tick.
+    counters_dirty: AtomicBool,
     persist_lock: tokio::sync::Mutex<()>,
     memory: RwLock<RuntimeMemory>,
 }
@@ -381,6 +445,16 @@ impl AppState {
             .await
             .map_err(|err| GatewayError::Internal(format!("turn-state bucket clear failed: {err}")))
     }
+
+    pub(crate) async fn delete_codex_turn_state_buckets_for_key(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<u64>, GatewayError> {
+        self.data
+            .delete_codex_turn_state_buckets_for_key(key_id)
+            .await
+            .map_err(|err| GatewayError::Internal(format!("turn-state bucket delete failed: {err}")))
+    }
 }
 
 impl Default for TurnStateRuntime {
@@ -394,6 +468,7 @@ impl TurnStateRuntime {
         Self {
             loaded: AtomicBool::new(false),
             renewal_worker_started: AtomicBool::new(false),
+            counters_dirty: AtomicBool::new(false),
             persist_lock: tokio::sync::Mutex::new(()),
             memory: RwLock::new(RuntimeMemory::default()),
         }
@@ -422,26 +497,57 @@ impl TurnStateRuntime {
                         let Ok(config) = runtime.config(&app).await else {
                             continue;
                         };
-                        if !config.enabled || !config.auto_renew {
+                        if !config.enabled {
+                            continue;
+                        }
+                        // Flush injection counters dirtied since the last
+                        // persist; the per-request path cannot afford a full
+                        // snapshot write on every bump.  A bump racing the
+                        // swap re-arms the flag and is flushed next tick.
+                        if runtime.counters_dirty.swap(false, Ordering::AcqRel) {
+                            let _ = runtime.persist(&app).await;
+                        }
+                        if !config.auto_renew {
                             continue;
                         }
                         let now = current_unix_secs();
+                        let Ok(scope) = runtime.scope_raw(&app).await else {
+                            continue;
+                        };
                         let due_keys = {
                             let memory = runtime.memory.read().await;
-                            memory
-                                .buckets
-                                .iter()
-                                .filter_map(|(key, bucket)| {
-                                    let due = bucket.expires_at_unix
-                                        <= now.saturating_add(config.renew_threshold_seconds);
-                                    due.then(|| {
-                                        key.split_once('\0').map(|(key_id, _)| key_id.to_string())
-                                    })
-                                    .flatten()
-                                })
-                                .collect::<std::collections::BTreeSet<_>>()
-                                .into_iter()
-                                .collect::<Vec<_>>()
+                            // A missing bucket never appears in the map, so the
+                            // due set is derived from the configured scope: a
+                            // (key, model) pair is due when its bucket is absent
+                            // or expires within the renewal threshold — the same
+                            // "missing means due now" rule the reference plugin
+                            // applies.
+                            let mut due = std::collections::BTreeSet::new();
+                            for key_id in &scope.key_ids {
+                                let key_id = key_id.trim();
+                                if key_id.is_empty() {
+                                    continue;
+                                }
+                                for model in &scope.models {
+                                    let model = model.trim();
+                                    if model.is_empty() {
+                                        continue;
+                                    }
+                                    let bucket_due = memory
+                                        .buckets
+                                        .get(bucket_key(key_id, model).as_str())
+                                        .map_or(true, |bucket| {
+                                            bucket.expires_at_unix
+                                                <= now.saturating_add(
+                                                    config.renew_threshold_seconds,
+                                                )
+                                        });
+                                    if bucket_due {
+                                        due.insert(key_id.to_string());
+                                    }
+                                }
+                            }
+                            due.into_iter().collect::<Vec<_>>()
                         };
                         if due_keys.is_empty() || runtime.probe_is_running().await {
                             continue;
@@ -482,6 +588,18 @@ impl TurnStateRuntime {
                 memory.rotating_cooldowns_until = snapshot.rotating_cooldowns_until;
                 memory.counters = snapshot.counters;
                 memory.probe_run = snapshot.probe_run;
+                // A persisted running flag means the previous process died
+                // mid-probe: no probe can be alive at load time.  Reset it
+                // instead of locking every future probe out behind a ghost.
+                if memory.probe_run.running {
+                    memory.probe_run.running = false;
+                    memory.probe_run.finished_at_unix = Some(current_unix_secs());
+                    memory
+                        .probe_run
+                        .lines
+                        .push("上次探测在进程退出时中断，已重置运行态".to_string());
+                    memory.probe_run.lines.truncate(200);
+                }
                 if let Some(secret) = app.data.encryption_key() {
                     for bucket in snapshot.buckets {
                         let Ok(value) =
@@ -782,6 +900,32 @@ impl TurnStateRuntime {
         Ok(cleared)
     }
 
+    /// Drop every trace of a deleted pool key: its buckets (memory and table),
+    /// verdict state, recorded health action, and any cooldown/backoff entries
+    /// keyed by it.  Without this the renewal loop would keep probing a ghost
+    /// account and the status page would list buckets nobody can ever use.
+    pub(crate) async fn purge_key(&self, app: &AppState, key_id: &str) -> Result<(), GatewayError> {
+        self.ensure_loaded(app).await?;
+        {
+            let mut memory = self.memory.write().await;
+            memory
+                .buckets
+                .retain(|key, _| key.split('\0').next() != Some(key_id));
+            memory.accounts.remove(key_id);
+            memory.health_action_applied.remove(key_id);
+            memory.account_backoff_until.remove(key_id);
+            memory.account_last_fired_unix.remove(key_id);
+            memory
+                .exit_cooldowns_until
+                .retain(|key, _| key.split('\0').nth(1) != Some(key_id));
+            memory
+                .rotating_cooldowns_until
+                .retain(|key, _| key.split('\0').nth(1) != Some(key_id));
+        }
+        app.delete_codex_turn_state_buckets_for_key(key_id).await?;
+        self.persist(app).await
+    }
+
     /// Claim a probe run and report whether this caller changed the state from
     /// idle to running.  The boolean prevents concurrent HTTP requests or the
     /// renewal worker from spawning duplicate local tasks for one run.
@@ -954,9 +1098,32 @@ impl TurnStateRuntime {
         };
         let mut round_observed = false;
         let mut round_complete = !models.is_empty();
-        for model in models {
+        let config = self.config(app).await.unwrap_or_default();
+        for (index, model) in models.iter().enumerate() {
             if !self.probe_is_running().await {
                 return Ok(());
+            }
+            // A bucket that is still comfortably live needs no probe: firing
+            // anyway would only burn upstream quota (the reference plugin's
+            // pending-target list holds missing/expired buckets only).  The
+            // known-good model still counts as recovered for the round.
+            let live = {
+                let memory = self.memory.read().await;
+                memory
+                    .buckets
+                    .get(bucket_key(key_id, model).as_str())
+                    .is_some_and(|bucket| {
+                        bucket.expires_at_unix
+                            > current_unix_secs().saturating_add(config.renew_threshold_seconds)
+                    })
+            };
+            if live {
+                round_observed = true;
+                observation.all_models_degraded = false;
+                observation.recovered_models.push(model.clone());
+                self.advance_probe(app, format!("{key_id}/{model}: 桶仍有效，跳过"))
+                    .await?;
+                continue;
             }
             let outcome = self.probe_one(app, scope, key_id, model).await;
             match outcome {
@@ -1015,6 +1182,18 @@ impl TurnStateRuntime {
                     self.project_probe_auth_failure(app, key_id, status).await?;
                     self.advance_probe(app, format!("{key_id}/{model}: account {status}"))
                         .await?;
+                    // The walk stops here, so the remaining models never get a
+                    // verdict this round; count them as done to keep the run's
+                    // progress honest.
+                    let remaining = models.len().saturating_sub(index + 1);
+                    if remaining > 0 {
+                        self.advance_probe_by(
+                            app,
+                            remaining,
+                            format!("{key_id}: 账号退避，剩余 {remaining} 个模型本轮跳过"),
+                        )
+                        .await?;
+                    }
                     break;
                 }
                 ProbeOneOutcome::Skipped(detail) => {
@@ -1220,8 +1399,17 @@ impl TurnStateRuntime {
     }
 
     async fn advance_probe(&self, app: &AppState, line: String) -> Result<(), GatewayError> {
+        self.advance_probe_by(app, 1, line).await
+    }
+
+    async fn advance_probe_by(
+        &self,
+        app: &AppState,
+        count: usize,
+        line: String,
+    ) -> Result<(), GatewayError> {
         let mut memory = self.memory.write().await;
-        memory.probe_run.done = memory.probe_run.done.saturating_add(1);
+        memory.probe_run.done = memory.probe_run.done.saturating_add(count);
         memory.probe_run.lines.push(line);
         memory.probe_run.lines.truncate(200);
         drop(memory);
@@ -1296,16 +1484,24 @@ impl TurnStateRuntime {
         let Some(token) = token.filter(|value| !value.trim().is_empty()) else {
             return ProbeOneOutcome::Skipped("credential unavailable".to_string());
         };
-        let account_id = auth_config
-            .as_ref()
-            .and_then(|value| value.get("account_id"))
-            .and_then(Value::as_str)
+        // The account id the upstream expects lives in the token's own auth
+        // claims (authoritative); the stored auth_config fields are only a
+        // fallback, exactly like the reference plugin's probeAccountID.
+        let account_id = probe_jwt_account_id(token.as_str())
+            .or_else(|| {
+                auth_config
+                    .as_ref()
+                    .and_then(|value| value.get("account_id"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
             .or_else(|| {
                 auth_config
                     .as_ref()
                     .and_then(|value| value.get("headers"))
                     .and_then(|value| value.get("chatgpt-account-id"))
                     .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
             });
 
         let mut attempted = false;
@@ -1323,11 +1519,22 @@ impl TurnStateRuntime {
             if self.exit_cooldown_active(cooldown_key.as_str(), now).await {
                 continue;
             }
+            // Mark the attempt before firing, exactly like the reference plugin:
+            // every outcome — success included — spends this exit's budget for
+            // the bucket, so a failing upstream can never be re-hit on every
+            // renewal tick.
+            self.set_exit_cooldown(
+                cooldown_key.clone(),
+                now.saturating_add(config.exit_cooldown_seconds),
+            )
+            .await;
             attempted = true;
+            self.pace_account(key_id, config.probe_account_pace_seconds)
+                .await;
             match self
                 .send_probe(
                     token.as_str(),
-                    account_id,
+                    account_id.as_deref(),
                     model,
                     Some(proxy.as_str()),
                     &config,
@@ -1347,11 +1554,6 @@ impl TurnStateRuntime {
                 ProbeResponse::Degraded => {
                     saw_degraded = true;
                     last_degraded_exit = Some(mask_proxy(proxy));
-                    self.set_exit_cooldown(
-                        cooldown_key,
-                        now.saturating_add(config.exit_cooldown_seconds),
-                    )
-                    .await;
                 }
                 ProbeResponse::AccountLimited(status) => {
                     self.set_account_backoff(
@@ -1363,9 +1565,11 @@ impl TurnStateRuntime {
                 }
                 ProbeResponse::NetworkFailure => {
                     saw_non_degraded = true;
+                    // A dead exit earns a shorter cooldown than the upfront
+                    // mark so a flaky network does not bench it for an hour.
                     self.set_exit_cooldown(
                         cooldown_key,
-                        now.saturating_add(config.exit_cooldown_seconds.min(300)),
+                        now.saturating_add(config.exit_cooldown_seconds.min(config.network_cooldown_seconds)),
                     )
                     .await;
                 }
@@ -1375,7 +1579,6 @@ impl TurnStateRuntime {
                     saw_non_degraded = true;
                 }
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
         }
 
         // A rotating gateway represents a shared virtual exit.  Try at most N
@@ -1387,15 +1590,26 @@ impl TurnStateRuntime {
                 .rotating_cooldown_active(rotating_key.as_str(), now)
                 .await
         {
-            let mut rotating_degraded = true;
+            // Pay the pool's cooldown budget up front, like the reference
+            // plugin: every walk through the rotating gateway costs the budget
+            // regardless of outcome, and a harvest upgrades it to the full
+            // exit cooldown.
+            self.set_rotating_cooldown(
+                rotating_key.clone(),
+                now.saturating_add(config.rotating_cooldown_seconds),
+            )
+            .await;
+            let rotating_start = probe_exit_start_index(key_id, scope.probe_proxies_rotating.len());
             for attempt in 0..config.rotating_max_attempts as usize {
-                let proxy =
-                    &scope.probe_proxies_rotating[attempt % scope.probe_proxies_rotating.len()];
+                let proxy = &scope.probe_proxies_rotating
+                    [(rotating_start + attempt) % scope.probe_proxies_rotating.len()];
                 attempted = true;
+                self.pace_account(key_id, config.probe_account_pace_seconds)
+                    .await;
                 match self
                     .send_probe(
                         token.as_str(),
-                        account_id,
+                        account_id.as_deref(),
                         model,
                         Some(proxy.as_str()),
                         &config,
@@ -1406,6 +1620,11 @@ impl TurnStateRuntime {
                         value,
                         issued_at_unix,
                     } => {
+                        self.set_rotating_cooldown(
+                            rotating_key,
+                            now.saturating_add(config.exit_cooldown_seconds),
+                        )
+                        .await;
                         return ProbeOneOutcome::Template {
                             value,
                             issued_at_unix,
@@ -1424,31 +1643,33 @@ impl TurnStateRuntime {
                         .await;
                         return ProbeOneOutcome::AccountLimited(status);
                     }
-                    ProbeResponse::NetworkFailure => {
-                        rotating_degraded = false;
-                        saw_non_degraded = true;
-                    }
-                    ProbeResponse::NoTurnState
+                    ProbeResponse::NetworkFailure
+                    | ProbeResponse::NoTurnState
                     | ProbeResponse::UnknownLength(_)
                     | ProbeResponse::UpstreamFailure(_) => {
-                        rotating_degraded = false;
                         saw_non_degraded = true;
                     }
                 }
-                if attempt + 1 < config.rotating_max_attempts as usize {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            }
-            if rotating_degraded {
-                self.set_rotating_cooldown(rotating_key, now.saturating_add(600))
-                    .await;
             }
         }
 
         // With no configured pool, retain the original direct-probe behavior.
         if !attempted && scope.probe_proxies.is_empty() && scope.probe_proxies_rotating.is_empty() {
+            // The direct exit spends the same per-bucket budget as any pool
+            // exit, keyed by the empty exit like the reference plugin.
+            let cooldown_key = exit_cooldown_key("", key_id, model);
+            if self.exit_cooldown_active(cooldown_key.as_str(), now).await {
+                return ProbeOneOutcome::Skipped("出口冷却中".to_string());
+            }
+            self.set_exit_cooldown(
+                cooldown_key.clone(),
+                now.saturating_add(config.exit_cooldown_seconds),
+            )
+            .await;
+            self.pace_account(key_id, config.probe_account_pace_seconds)
+                .await;
             match self
-                .send_probe(token.as_str(), account_id, model, None, &config)
+                .send_probe(token.as_str(), account_id.as_deref(), model, None, &config)
                 .await
             {
                 ProbeResponse::Template {
@@ -1473,8 +1694,15 @@ impl TurnStateRuntime {
                     .await;
                     return ProbeOneOutcome::AccountLimited(status);
                 }
-                ProbeResponse::NetworkFailure
-                | ProbeResponse::NoTurnState
+                ProbeResponse::NetworkFailure => {
+                    saw_non_degraded = true;
+                    self.set_exit_cooldown(
+                        cooldown_key,
+                        now.saturating_add(config.exit_cooldown_seconds.min(config.network_cooldown_seconds)),
+                    )
+                    .await;
+                }
+                ProbeResponse::NoTurnState
                 | ProbeResponse::UnknownLength(_)
                 | ProbeResponse::UpstreamFailure(_) => {
                     saw_non_degraded = true;
@@ -1502,7 +1730,7 @@ impl TurnStateRuntime {
         config: &TurnStateConfig,
     ) -> ProbeResponse {
         let mut builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::none());
         if let Some(proxy) = proxy.filter(|value| !value.trim().is_empty()) {
             let Ok(proxy) = reqwest::Proxy::all(proxy) else {
@@ -1532,7 +1760,8 @@ impl TurnStateRuntime {
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
             .header("originator", "codex-tui")
-            .header("user-agent", "aether-codex-turn-state/1")
+            .header("session-id", uuid::Uuid::new_v4().to_string())
+            .header("user-agent", PROBE_USER_AGENT)
             .json(&body);
         let request = if let Some(account_id) = account_id.filter(|value| !value.trim().is_empty())
         {
@@ -1657,6 +1886,32 @@ impl TurnStateRuntime {
             .insert(key, until);
     }
 
+    /// Enforce the per-account pacing budget before every upstream call, across
+    /// exit loops and bucket boundaries alike — the reference plugin's
+    /// probeAccountPace.  The timestamp is marked before firing on purpose:
+    /// the call's own duration then counts toward the gap.
+    async fn pace_account(&self, key_id: &str, pace_seconds: u64) {
+        let now = current_unix_secs();
+        let last = self
+            .memory
+            .read()
+            .await
+            .account_last_fired_unix
+            .get(key_id)
+            .copied();
+        if let Some(last) = last {
+            let elapsed = now.saturating_sub(last);
+            if elapsed < pace_seconds {
+                tokio::time::sleep(Duration::from_secs(pace_seconds - elapsed)).await;
+            }
+        }
+        self.memory
+            .write()
+            .await
+            .account_last_fired_unix
+            .insert(key_id.to_string(), current_unix_secs());
+    }
+
     async fn store_probe_template(
         &self,
         app: &AppState,
@@ -1713,6 +1968,7 @@ impl TurnStateRuntime {
 
     pub(crate) async fn proxy_check(&self, app: &AppState) -> Result<Value, GatewayError> {
         let scope = self.scope_raw(app).await?;
+        let config = self.config(app).await.unwrap_or_default();
         let mut targets = Vec::new();
         for proxy in scope.probe_proxies {
             targets.push(("static", proxy));
@@ -1723,128 +1979,164 @@ impl TurnStateRuntime {
         if targets.is_empty() {
             targets.push(("static", String::new()));
         }
-        let mut results = Vec::with_capacity(targets.len());
-        for (pool, raw_proxy) in targets {
-            let masked = if raw_proxy.is_empty() {
-                "direct".to_string()
-            } else {
-                mask_proxy(&raw_proxy)
-            };
-            let mut builder = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(8))
-                .redirect(reqwest::redirect::Policy::none());
-            if !raw_proxy.is_empty() {
-                let Ok(proxy) = reqwest::Proxy::all(&raw_proxy) else {
-                    results.push(json!({
-                        "proxy": masked,
-                        "pool": pool,
-                        "reachable": false,
-                        "status_code": null,
-                        "detail": "代理 URL 无法解析",
-                        "exit_ip": null,
-                        "country": null,
-                        "cf_colo": null,
-                        "warning": null
-                    }));
-                    continue;
-                };
-                builder = builder.proxy(proxy);
+        // Run checks concurrently under one shared deadline: a pool full of
+        // dead proxies must not hold the admin request hostage for minutes
+        // (the reference plugin used 6 workers with a 45s total budget).
+        let concurrency = config.proxy_check_concurrency.max(1) as usize;
+        let deadline = std::time::Instant::now()
+            + Duration::from_secs(config.proxy_check_total_budget_seconds);
+        let per_check_timeout = config.proxy_check_timeout_seconds;
+        let results = futures_util::stream::iter(targets.into_iter().map(|(pool, raw_proxy)| {
+            async move {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Self::proxy_check_budget_exceeded(pool, raw_proxy.as_str());
+                }
+                match tokio::time::timeout(
+                    remaining,
+                    Self::proxy_check_one(pool, raw_proxy.clone(), per_check_timeout),
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(_) => Self::proxy_check_budget_exceeded(pool, raw_proxy.as_str()),
+                }
             }
-            let Ok(client) = builder.build() else {
-                results.push(json!({
+        }))
+        .buffered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+        Ok(Value::Array(results))
+    }
+
+    async fn proxy_check_one(pool: &str, raw_proxy: String, timeout_seconds: u64) -> Value {
+        let masked = if raw_proxy.is_empty() {
+            "direct".to_string()
+        } else {
+            mask_proxy(&raw_proxy)
+        };
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_seconds))
+            .redirect(reqwest::redirect::Policy::none());
+        if !raw_proxy.is_empty() {
+            let Ok(proxy) = reqwest::Proxy::all(&raw_proxy) else {
+                return json!({
                     "proxy": masked,
                     "pool": pool,
                     "reachable": false,
                     "status_code": null,
-                    "detail": "无法建立代理客户端",
+                    "detail": "代理 URL 无法解析",
                     "exit_ip": null,
                     "country": null,
                     "cf_colo": null,
                     "warning": null
-                }));
-                continue;
-            };
-            let first_trace = read_proxy_trace(&client).await;
-            let second_trace = if pool == "static" {
-                // A static pool is expected to keep one exit.  Two bounded
-                // trace reads make a rotation visible to the admin UI without
-                // ever exposing proxy credentials.
-                read_proxy_trace(&client).await
-            } else {
-                None
-            };
-            let exit_ip = first_trace
-                .as_ref()
-                .and_then(|trace| trace.ip.clone())
-                .or_else(|| second_trace.as_ref().and_then(|trace| trace.ip.clone()));
-            let country = first_trace
-                .as_ref()
-                .and_then(|trace| trace.country.clone())
-                .or_else(|| {
-                    second_trace
-                        .as_ref()
-                        .and_then(|trace| trace.country.clone())
                 });
-            let cf_colo = first_trace
-                .as_ref()
-                .and_then(|trace| trace.cf_colo.clone())
-                .or_else(|| {
-                    second_trace
-                        .as_ref()
-                        .and_then(|trace| trace.cf_colo.clone())
-                });
-            let warning = if pool == "static" {
-                static_trace_warning(first_trace.as_ref(), second_trace.as_ref())
-            } else {
-                None
             };
-            let response = client
-                .post("https://chatgpt.com/backend-api/codex/responses")
-                .header("content-type", "application/json")
-                .header("accept", "text/event-stream")
-                .json(&json!({
-                    "model": "gpt-5.5",
-                    "stream": true,
-                    "store": false,
-                    "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ping"}]}]
-                }))
-                .send()
-                .await;
-            match response {
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    let detail = match status {
-                        401 => "通（上游返回 401）",
-                        403 => "已到达上游，但被拒绝（403）",
-                        429 => "已到达上游，但被限速（429）",
-                        _ => "已收到上游响应",
-                    };
-                    results.push(json!({
-                        "proxy": masked,
-                        "pool": pool,
-                        "reachable": true,
-                        "status_code": status,
-                        "detail": detail,
-                        "exit_ip": exit_ip,
-                        "country": country,
-                        "cf_colo": cf_colo,
-                        "warning": warning
-                    }));
-                }
-                Err(err) => results.push(json!({
+            builder = builder.proxy(proxy);
+        }
+        let Ok(client) = builder.build() else {
+            return json!({
+                "proxy": masked,
+                "pool": pool,
+                "reachable": false,
+                "status_code": null,
+                "detail": "无法建立代理客户端",
+                "exit_ip": null,
+                "country": null,
+                "cf_colo": null,
+                "warning": null
+            });
+        };
+        let first_trace = read_proxy_trace(&client).await;
+        let second_trace = if pool == "static" {
+            // A static pool is expected to keep one exit.  Two bounded
+            // trace reads make a rotation visible to the admin UI without
+            // ever exposing proxy credentials.
+            read_proxy_trace(&client).await
+        } else {
+            None
+        };
+        let exit_ip = first_trace
+            .as_ref()
+            .and_then(|trace| trace.ip.clone())
+            .or_else(|| second_trace.as_ref().and_then(|trace| trace.ip.clone()));
+        let country = first_trace
+            .as_ref()
+            .and_then(|trace| trace.country.clone())
+            .or_else(|| second_trace.as_ref().and_then(|trace| trace.country.clone()));
+        let cf_colo = first_trace
+            .as_ref()
+            .and_then(|trace| trace.cf_colo.clone())
+            .or_else(|| second_trace.as_ref().and_then(|trace| trace.cf_colo.clone()));
+        let warning = if pool == "static" {
+            static_trace_warning(first_trace.as_ref(), second_trace.as_ref())
+        } else {
+            None
+        };
+        let response = client
+            .post("https://chatgpt.com/backend-api/codex/responses")
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .json(&json!({
+                "model": "gpt-5.5",
+                "stream": true,
+                "store": false,
+                "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ping"}]}]
+            }))
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let detail = match status {
+                    401 => "通（上游返回 401）",
+                    403 => "已到达上游，但被拒绝（403）",
+                    429 => "已到达上游，但被限速（429）",
+                    _ => "已收到上游响应",
+                };
+                json!({
                     "proxy": masked,
                     "pool": pool,
-                    "reachable": false,
-                    "status_code": null,
-                    "detail": format!("无法连接：{}", redact_error(err.to_string().as_str())),
+                    "reachable": true,
+                    "status_code": status,
+                    "detail": detail,
                     "exit_ip": exit_ip,
                     "country": country,
                     "cf_colo": cf_colo,
                     "warning": warning
-                })),
+                })
             }
+            Err(err) => json!({
+                "proxy": masked,
+                "pool": pool,
+                "reachable": false,
+                "status_code": null,
+                "detail": format!("无法连接：{}", redact_error(err.to_string().as_str())),
+                "exit_ip": exit_ip,
+                "country": country,
+                "cf_colo": cf_colo,
+                "warning": warning
+            }),
         }
-        Ok(Value::Array(results))
+    }
+
+    fn proxy_check_budget_exceeded(pool: &str, raw_proxy: &str) -> Value {
+        let masked = if raw_proxy.is_empty() {
+            "direct".to_string()
+        } else {
+            mask_proxy(raw_proxy)
+        };
+        json!({
+            "proxy": masked,
+            "pool": pool,
+            "reachable": false,
+            "status_code": null,
+            "detail": "检查超出总时间预算",
+            "exit_ip": null,
+            "country": null,
+            "cf_colo": null,
+            "warning": null
+        })
     }
 
     pub(crate) async fn status_json(&self, app: &AppState) -> Result<Value, GatewayError> {
@@ -1953,6 +2245,10 @@ impl TurnStateRuntime {
                 .await;
             return Ok(());
         }
+        // Pin the resolved model into the report context so passive harvesting
+        // on the response path buckets the template under the exact same name
+        // the injection path looked up.
+        merge_report_context(report_context, "turn_state_model", json!(model));
         let bucket = {
             let memory = self.memory.read().await;
             memory
@@ -2041,7 +2337,14 @@ impl TurnStateRuntime {
             .filter(|value| !value.is_empty())
             .unwrap_or_default();
         let model = report_context
-            .and_then(|value| value.get("mapped_model").or_else(|| value.get("model")))
+            .and_then(|value| {
+                // `turn_state_model` is pinned by the injection path and is
+                // authoritative for bucket-key consistency.
+                value
+                    .get("turn_state_model")
+                    .or_else(|| value.get("mapped_model"))
+                    .or_else(|| value.get("model"))
+            })
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -2129,6 +2432,10 @@ impl TurnStateRuntime {
             memory.counters.since_unix = current_unix_secs();
         }
         update(&mut memory.counters);
+        drop(memory);
+        // A full snapshot write per request is too heavy for the injection
+        // path; the renewal loop flushes dirty counters once per tick.
+        self.counters_dirty.store(true, Ordering::Release);
     }
 
     pub(crate) async fn persist_now(&self, app: &AppState) -> Result<(), GatewayError> {
@@ -2192,6 +2499,30 @@ fn probe_exit_start_index(key_id: &str, pool_len: usize) -> usize {
     prefix.copy_from_slice(&digest[..8]);
     let value = u64::from_be_bytes(prefix);
     (value as usize) % pool_len
+}
+
+/// Read the account id from the access token's own JWT claims — the
+/// authoritative source the upstream expects in `chatgpt-account-id`.
+/// Mirrors the reference plugin's probeAccountID: only the
+/// `https://api.openai.com/auth` claim's `chatgpt_account_id` is read, and
+/// the token itself is never logged.
+fn probe_jwt_account_id(token: &str) -> Option<String> {
+    let mut parts = token.split('.');
+    let payload = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(_), Some(payload), Some(_), None) => payload,
+        _ => return None,
+    };
+    let raw = URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&raw).ok()?;
+    claims
+        .get("https://api.openai.com/auth")?
+        .get("chatgpt_account_id")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn is_codex_plan(plan: &ExecutionPlan) -> bool {

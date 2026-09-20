@@ -104,9 +104,17 @@ pub(super) async fn maybe_build_local_admin_turn_state_response(
             return Ok(Some(Json(runtime.cancel_probe(app).await?).into_response()));
         }
         "probe_start" if request_context.method() == http::Method::POST => {
-            let requested = request_body
-                .and_then(|body| serde_json::from_slice::<ProbeRequest>(body).ok())
-                .and_then(|payload| payload.key_ids);
+            // No body means a full sweep of the configured scope; a malformed
+            // body is an operator error and must never silently widen into one.
+            let requested = match request_body {
+                Some(body) if !body.is_empty() => {
+                    let Ok(payload) = serde_json::from_slice::<ProbeRequest>(body) else {
+                        return Ok(Some(bad_request("探测请求格式无效")));
+                    };
+                    payload.key_ids
+                }
+                _ => None,
+            };
             let (run, claimed) = runtime.start_probe_claim(app, requested.clone()).await?;
             if claimed {
                 let worker_runtime = Arc::clone(runtime);

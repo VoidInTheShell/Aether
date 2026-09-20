@@ -1095,6 +1095,13 @@ impl AppState {
                     );
                 }
             }
+            if let Err(err) = self.codex_turn_state.purge_key(self, key_id).await {
+                warn!(
+                    key_id = %key_id,
+                    error = ?err,
+                    "gateway provider catalog key delete: failed to purge codex turn-state data"
+                );
+            }
             self.invalidate_provider_routing_caches();
         }
         Ok(deleted)
@@ -1125,6 +1132,17 @@ impl AppState {
                     key_id = %delete.key_id,
                     error = ?err,
                     "gateway provider catalog OAuth credential CAS delete: failed to delete pool member scores"
+                );
+            }
+            if let Err(err) = self
+                .codex_turn_state
+                .purge_key(self, delete.key_id.as_str())
+                .await
+            {
+                warn!(
+                    key_id = %delete.key_id,
+                    error = ?err,
+                    "gateway provider catalog OAuth credential CAS delete: failed to purge codex turn-state data"
                 );
             }
             self.invalidate_provider_routing_caches();

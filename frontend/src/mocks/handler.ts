@@ -1474,6 +1474,12 @@ const mockTurnStateConfig = {
   exit_cooldown_seconds: 3300,
   rotating_max_attempts: 10,
   max_accounts_in_flight: 4,
+  rotating_cooldown_seconds: 600,
+  network_cooldown_seconds: 300,
+  probe_account_pace_seconds: 2,
+  proxy_check_timeout_seconds: 8,
+  proxy_check_concurrency: 6,
+  proxy_check_total_budget_seconds: 45,
 }
 
 /**

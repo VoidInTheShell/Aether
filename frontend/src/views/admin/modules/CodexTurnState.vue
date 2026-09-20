@@ -890,6 +890,12 @@ const DEFAULT_CONFIG: TurnStateConfig = {
   exit_cooldown_seconds: 3300,
   rotating_max_attempts: 10,
   max_accounts_in_flight: 4,
+  rotating_cooldown_seconds: 600,
+  network_cooldown_seconds: 300,
+  probe_account_pace_seconds: 2,
+  proxy_check_timeout_seconds: 8,
+  proxy_check_concurrency: 6,
+  proxy_check_total_budget_seconds: 45,
 }
 
 const injectModeOptions: Array<{ value: TurnStateInjectMode; label: string; helper: string }> = [
@@ -921,6 +927,12 @@ const advancedFields: AdvancedField[] = [
   { key: 'exit_cooldown_seconds', min: 300, max: 86400, fallback: 3300, helper: '单条静态出口对同一桶的冷却（秒），默认 3300（55 分钟）。' },
   { key: 'rotating_max_attempts', min: 1, max: 100, fallback: 10, helper: '轮换池对同一桶最多连试次数，默认 10。' },
   { key: 'max_accounts_in_flight', min: 1, max: 32, fallback: 4, helper: '同时在探测的账号数上限，默认 4。' },
+  { key: 'rotating_cooldown_seconds', min: 60, max: 86400, fallback: 600, helper: '轮换池整池冷却（秒），默认 600（10 分钟）。一轮探测把池子转完后歇这么久再转。' },
+  { key: 'network_cooldown_seconds', min: 30, max: 3600, fallback: 300, helper: '出口网络错误的短冷却（秒），默认 300。网络抖动不当作降智，休息一会儿再试。' },
+  { key: 'probe_account_pace_seconds', min: 1, max: 60, fallback: 2, helper: '同一账号两次上游探测的最小间隔（秒），默认 2。防止把账号打出风控。' },
+  { key: 'proxy_check_timeout_seconds', min: 2, max: 60, fallback: 8, helper: '代理可用性检查的单次请求超时（秒），默认 8。' },
+  { key: 'proxy_check_concurrency', min: 1, max: 16, fallback: 6, helper: '代理检查的并发数，默认 6。代理多时可调大加快检查。' },
+  { key: 'proxy_check_total_budget_seconds', min: 10, max: 300, fallback: 45, helper: '代理检查的总时间预算（秒），默认 45。超预算的剩余条目标记为预算耗尽。' },
 ]
 
 const moduleStore = useModuleStore()

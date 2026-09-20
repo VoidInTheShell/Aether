@@ -668,15 +668,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aether-turn-state"
-version = "0.1.0"
-dependencies = [
- "base64",
- "serde",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "aether-tunnel"
 version = "0.3.17"
 dependencies = [
@@ -720,6 +711,15 @@ dependencies = [
  "url",
  "uuid",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "aether-turn-state"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

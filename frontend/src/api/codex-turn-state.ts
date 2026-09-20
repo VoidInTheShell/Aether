@@ -134,6 +134,18 @@ export interface TurnStateConfig {
   rotating_max_attempts: number
   /** 同时在探测的账号数上限 */
   max_accounts_in_flight: number
+  /** 轮换池整池冷却（秒），默认 600（10 分钟） */
+  rotating_cooldown_seconds: number
+  /** 出口网络错误的短冷却（秒），默认 300 */
+  network_cooldown_seconds: number
+  /** 同一账号两次上游探测的最小间隔（秒），默认 2 */
+  probe_account_pace_seconds: number
+  /** 代理可用性检查的单次请求超时（秒），默认 8 */
+  proxy_check_timeout_seconds: number
+  /** 代理检查的并发数，默认 6 */
+  proxy_check_concurrency: number
+  /** 代理检查的总时间预算（秒），超时条目标记为预算耗尽，默认 45 */
+  proxy_check_total_budget_seconds: number
 }
 
 export type TurnStateProxyPool = 'static' | 'rotating'

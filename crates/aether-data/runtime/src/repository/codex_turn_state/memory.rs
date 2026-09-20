@@ -60,7 +60,7 @@ impl CodexTurnStateBucketReadRepository for InMemoryCodexTurnStateBucketReposito
         &self,
         threshold_unix_secs: i64,
     ) -> Result<Vec<StoredCodexTurnStateBucket>, DataLayerError> {
-        Ok(self
+        let mut due: Vec<_> = self
             .buckets
             .read()
             .map_err(|_| {
@@ -69,7 +69,10 @@ impl CodexTurnStateBucketReadRepository for InMemoryCodexTurnStateBucketReposito
             .values()
             .filter(|bucket| bucket.expires_at_unix_secs <= threshold_unix_secs)
             .cloned()
-            .collect())
+            .collect();
+        // Match the Postgres ordering: soonest-expiring first.
+        due.sort_by_key(|bucket| bucket.expires_at_unix_secs);
+        Ok(due)
     }
 }
 
@@ -79,6 +82,11 @@ impl CodexTurnStateBucketWriteRepository for InMemoryCodexTurnStateBucketReposit
         &self,
         input: UpsertCodexTurnStateBucket,
     ) -> Result<bool, DataLayerError> {
+        if input.key_id.trim().is_empty() || input.model.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "codex turn-state bucket identity is empty".into(),
+            ));
+        }
         let mut buckets = self.buckets.write().map_err(|_| {
             DataLayerError::UnexpectedValue("codex turn-state memory lock poisoned".into())
         })?;
