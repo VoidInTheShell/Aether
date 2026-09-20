@@ -1035,6 +1035,10 @@ async fn gateway_handles_admin_modules_status_locally_with_trusted_admin_princip
         "/admin/modules/chat-pii-redaction"
     );
     assert_eq!(
+        payload["codex_turn_state"]["admin_menu_group"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
         payload["important_notification"]["config_validated"],
         json!(true)
     );

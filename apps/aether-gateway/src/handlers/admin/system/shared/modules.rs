@@ -83,7 +83,7 @@ pub(crate) const ADMIN_MODULE_DEFINITIONS: &[AdminModuleDefinition] = &[
         default_available: true,
         admin_route: Some("/admin/modules/codex-turn-state"),
         admin_menu_icon: Some("Activity"),
-        admin_menu_group: Some("system"),
+        admin_menu_group: None,
         admin_menu_order: 59,
     },
     AdminModuleDefinition {
