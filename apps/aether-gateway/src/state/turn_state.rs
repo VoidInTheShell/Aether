@@ -538,7 +538,7 @@ impl TurnStateRuntime {
                                     let bucket_due = memory
                                         .buckets
                                         .get(bucket_key(key_id, model).as_str())
-                                        .map_or(true, |bucket| {
+                                        .is_none_or(|bucket| {
                                             bucket.expires_at_unix
                                                 <= now
                                                     .saturating_add(config.renew_threshold_seconds)
