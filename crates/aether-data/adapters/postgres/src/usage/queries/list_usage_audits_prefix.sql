@@ -183,6 +183,9 @@ SELECT
       OR NULLIF(BTRIM("usage".request_metadata->>'provider_reasoning_effort'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'provider_service_tier'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'provider_actual_service_tier'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->>'turn_state_verdict'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->>'turn_state_model_degraded'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->>'turn_state_action'), '') IS NOT NULL
       OR ("usage".request_metadata->>'client_requested_stream') IN ('true', 'false')
       OR ("usage".request_metadata->>'upstream_is_stream') IN ('true', 'false')
       OR ("usage".request_metadata->>'websocket_mode') IN ('true', 'false')
@@ -208,6 +211,12 @@ SELECT
         NULLIF(BTRIM("usage".request_metadata->>'provider_service_tier'), ''),
         'provider_actual_service_tier',
         NULLIF(BTRIM("usage".request_metadata->>'provider_actual_service_tier'), ''),
+        'turn_state_verdict',
+        NULLIF(BTRIM("usage".request_metadata->>'turn_state_verdict'), ''),
+        'turn_state_model_degraded',
+        NULLIF(BTRIM("usage".request_metadata->>'turn_state_model_degraded'), ''),
+        'turn_state_action',
+        NULLIF(BTRIM("usage".request_metadata->>'turn_state_action'), ''),
         'client_requested_stream',
         CASE
           WHEN ("usage".request_metadata->>'client_requested_stream') IN ('true', 'false')
