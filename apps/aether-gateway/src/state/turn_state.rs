@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
+use tracing::warn;
 use url::Url;
 
 use super::AppState;
@@ -37,6 +38,13 @@ const TURN_STATE_RUNTIME_KEY: &str = "module.codex_turn_state.runtime";
 const TURN_STATE_DESCRIPTION: &str = "Codex Turn-State runtime state (encrypted bucket values)";
 const TURN_STATE_PROBE_LOCK_KEY: &str = "codex_turn_state:probe";
 const TURN_STATE_PROBE_LOCK_TTL: Duration = Duration::from_secs(60 * 60);
+/// Compound in-memory map keys (bucket / exit-cooldown / rotating-cooldown)
+/// are persisted verbatim inside the runtime JSON snapshot, which sqlx binds
+/// as PostgreSQL `jsonb`. `jsonb` rejects `\u0000` escapes
+/// ("unsupported Unicode escape sequence"), so the separator must never be
+/// NUL; the ASCII unit separator is jsonb-safe and cannot collide with key
+/// ids (UUIDs), model names, or hex exit hashes.
+const TURN_STATE_KEY_SEPARATOR: char = '\u{1f}';
 /// A probe must be indistinguishable from ordinary codex-tui traffic: a
 /// self-identifying user-agent invites risk-control divergence upstream.
 const PROBE_USER_AGENT: &str = "codex-tui/0.154.0 (Ubuntu 24.04; x86_64) OVH (codex-tui; 0.154.0)";
@@ -552,11 +560,20 @@ impl TurnStateRuntime {
                         if due_keys.is_empty() || runtime.probe_is_running().await {
                             continue;
                         }
-                        let Ok((run, claimed)) = runtime
+                        let (run, claimed) = match runtime
                             .start_probe_claim(&app, Some(due_keys.clone()))
                             .await
-                        else {
-                            continue;
+                        {
+                            Ok(claimed) => claimed,
+                            Err(err) => {
+                                warn!(
+                                    event_name = "codex_turn_state_probe_claim_failed",
+                                    log_type = "ops",
+                                    error = ?err,
+                                    "turn-state renewal failed to claim probe run"
+                                );
+                                continue;
+                            }
                         };
                         if !claimed || run.get("running").and_then(Value::as_bool) != Some(true) {
                             continue;
@@ -678,7 +695,7 @@ impl TurnStateRuntime {
         let mut persisted_buckets = Vec::with_capacity(memory.buckets.len());
         let mut repository_buckets = Vec::with_capacity(memory.buckets.len());
         for (key, bucket) in memory.buckets {
-            let Some((key_id, model)) = key.split_once('\0') else {
+            let Some((key_id, model)) = key.split_once(TURN_STATE_KEY_SEPARATOR) else {
                 continue;
             };
             let encrypted_value =
@@ -910,17 +927,17 @@ impl TurnStateRuntime {
             let mut memory = self.memory.write().await;
             memory
                 .buckets
-                .retain(|key, _| key.split('\0').next() != Some(key_id));
+                .retain(|key, _| key.split(TURN_STATE_KEY_SEPARATOR).next() != Some(key_id));
             memory.accounts.remove(key_id);
             memory.health_action_applied.remove(key_id);
             memory.account_backoff_until.remove(key_id);
             memory.account_last_fired_unix.remove(key_id);
             memory
                 .exit_cooldowns_until
-                .retain(|key, _| key.split('\0').nth(1) != Some(key_id));
+                .retain(|key, _| key.split(TURN_STATE_KEY_SEPARATOR).nth(1) != Some(key_id));
             memory
                 .rotating_cooldowns_until
-                .retain(|key, _| key.split('\0').nth(1) != Some(key_id));
+                .retain(|key, _| key.split(TURN_STATE_KEY_SEPARATOR).nth(1) != Some(key_id));
         }
         app.delete_codex_turn_state_buckets_for_key(key_id).await?;
         self.persist(app).await
@@ -960,7 +977,21 @@ impl TurnStateRuntime {
                 lines: Vec::new(),
             };
         }
-        self.persist(app).await?;
+        if let Err(err) = self.persist(app).await {
+            // Roll the claim back before surfacing the failure: a snapshot
+            // write that fails must never leave a ghost `running` flag
+            // behind, or every future probe (renewal loop and manual start
+            // alike) stays locked out until a process restart.
+            let mut memory = self.memory.write().await;
+            memory.probe_run.running = false;
+            memory.probe_run.finished_at_unix = Some(current_unix_secs());
+            memory
+                .probe_run
+                .lines
+                .push("探测声明持久化失败，已回滚运行态".to_string());
+            memory.probe_run.lines.truncate(200);
+            return Err(err);
+        }
         Ok((self.probe_run_json().await, true))
     }
 
@@ -1221,7 +1252,18 @@ impl TurnStateRuntime {
             self.apply_verdict_health_transition(app, key_id, transition, &config)
                 .await?;
         }
-        self.persist(app).await
+        // Verdict state is already committed in memory; a failed snapshot
+        // write must not fail the whole probe round.
+        if let Err(err) = self.persist(app).await {
+            warn!(
+                event_name = "codex_turn_state_round_persist_failed",
+                log_type = "ops",
+                key_id = %key_id,
+                error = ?err,
+                "turn-state failed to persist account round"
+            );
+        }
+        Ok(())
     }
 
     async fn project_probe_auth_failure(
@@ -1413,7 +1455,18 @@ impl TurnStateRuntime {
         memory.probe_run.lines.push(line);
         memory.probe_run.lines.truncate(200);
         drop(memory);
-        self.persist(app).await
+        // The progress line is already durable in memory; a failed snapshot
+        // write must not abort the probe walk. The next mutation retries the
+        // full snapshot, so surface the failure as a log only.
+        if let Err(err) = self.persist(app).await {
+            warn!(
+                event_name = "codex_turn_state_probe_progress_persist_failed",
+                log_type = "ops",
+                error = ?err,
+                "turn-state failed to persist probe progress"
+            );
+        }
+        Ok(())
     }
 
     async fn finish_probe(&self, app: &AppState, line: String) -> Result<(), GatewayError> {
@@ -1423,7 +1476,18 @@ impl TurnStateRuntime {
         memory.probe_run.lines.push(line);
         memory.probe_run.lines.truncate(200);
         drop(memory);
-        self.persist(app).await
+        // `running=false` is already committed in memory; tolerate snapshot
+        // write failures so the run state can never stay stuck on `running`
+        // because of a transient database error.
+        if let Err(err) = self.persist(app).await {
+            warn!(
+                event_name = "codex_turn_state_probe_finish_persist_failed",
+                log_type = "ops",
+                error = ?err,
+                "turn-state failed to persist finished probe run"
+            );
+        }
+        Ok(())
     }
 
     async fn probe_one(
@@ -1971,7 +2035,19 @@ impl TurnStateRuntime {
             )
             .await?;
         }
-        self.persist(app).await
+        // The bucket is already committed in memory; a failed snapshot write
+        // must not abort the enclosing probe walk.
+        if let Err(err) = self.persist(app).await {
+            warn!(
+                event_name = "codex_turn_state_bucket_persist_failed",
+                log_type = "ops",
+                key_id = %key_id,
+                model = %model,
+                error = ?err,
+                "turn-state failed to persist harvested bucket"
+            );
+        }
+        Ok(())
     }
 
     pub(crate) async fn proxy_check(&self, app: &AppState) -> Result<Value, GatewayError> {
@@ -2210,7 +2286,7 @@ impl TurnStateRuntime {
         let memory = self.memory.read().await.clone();
         let mut key_ids = std::collections::BTreeSet::new();
         for key in memory.buckets.keys() {
-            if let Some((key_id, _)) = key.split_once('\0') {
+            if let Some((key_id, _)) = key.split_once(TURN_STATE_KEY_SEPARATOR) {
                 key_ids.insert(key_id.to_string());
             }
         }
@@ -2238,7 +2314,7 @@ impl TurnStateRuntime {
         };
         let mut buckets = Vec::with_capacity(memory.buckets.len());
         for (key, bucket) in &memory.buckets {
-            let Some((key_id, model)) = key.split_once('\0') else {
+            let Some((key_id, model)) = key.split_once(TURN_STATE_KEY_SEPARATOR) else {
                 continue;
             };
             let ready = bucket.value.len() == config.template_length
@@ -2509,7 +2585,11 @@ impl TurnStateRuntime {
 }
 
 fn bucket_key(key_id: &str, model: &str) -> String {
-    format!("{}\0{}", key_id.trim(), model.trim())
+    format!(
+        "{key_id}{TURN_STATE_KEY_SEPARATOR}{model}",
+        key_id = key_id.trim(),
+        model = model.trim()
+    )
 }
 
 fn codex_health_api_format(api_formats: &Option<Value>) -> String {
@@ -2538,15 +2618,19 @@ fn codex_health_api_format(api_formats: &Option<Value>) -> String {
 
 fn exit_cooldown_key(proxy: &str, key_id: &str, model: &str) -> String {
     format!(
-        "{}\0{}\0{}",
-        hash_probe_exit(proxy),
-        key_id.trim(),
-        model.trim()
+        "{exit}{TURN_STATE_KEY_SEPARATOR}{key_id}{TURN_STATE_KEY_SEPARATOR}{model}",
+        exit = hash_probe_exit(proxy),
+        key_id = key_id.trim(),
+        model = model.trim()
     )
 }
 
 fn rotating_cooldown_key(key_id: &str, model: &str) -> String {
-    format!("__rotating__\0{}\0{}", key_id.trim(), model.trim())
+    format!(
+        "__rotating__{TURN_STATE_KEY_SEPARATOR}{key_id}{TURN_STATE_KEY_SEPARATOR}{model}",
+        key_id = key_id.trim(),
+        model = model.trim()
+    )
 }
 
 fn hash_probe_exit(proxy: &str) -> String {
@@ -2820,7 +2904,32 @@ mod tests {
     use aether_contracts::{ExecutionPlan, RequestBody};
     use serde_json::json;
 
-    use super::{redact_error, turn_state_model_for_plan};
+    use super::{
+        bucket_key, exit_cooldown_key, redact_error, rotating_cooldown_key,
+        turn_state_model_for_plan, TURN_STATE_KEY_SEPARATOR,
+    };
+
+    #[test]
+    fn compound_map_keys_are_jsonb_safe() {
+        // PostgreSQL `jsonb` rejects `\u0000` escapes
+        // ("unsupported Unicode escape sequence"), and the runtime snapshot
+        // persists these map keys verbatim — the compound keys must never
+        // contain NUL. See TURN_STATE_KEY_SEPARATOR.
+        let bucket = bucket_key("key-1", "gpt-5.6");
+        let exit = exit_cooldown_key("socks5://user:pass@host:1080", "key-1", "gpt-5.6");
+        let rotating = rotating_cooldown_key("key-1", "gpt-5.6");
+        for key in [&bucket, &exit, &rotating] {
+            assert!(!key.contains('\0'));
+            // The separator must survive a JSON round-trip intact.
+            let encoded = serde_json::to_string(key).expect("serialize key");
+            let decoded: String = serde_json::from_str(&encoded).expect("deserialize key");
+            assert_eq!(decoded, *key);
+            // The key must still split back into its components.
+            assert!(key.split(TURN_STATE_KEY_SEPARATOR).count() >= 2);
+        }
+        assert_eq!(bucket, format!("key-1{TURN_STATE_KEY_SEPARATOR}gpt-5.6"));
+        assert!(rotating.starts_with("__rotating__"));
+    }
 
     fn sample_plan(body: serde_json::Value, model_name: &str) -> ExecutionPlan {
         ExecutionPlan {
