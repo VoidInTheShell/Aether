@@ -67,5 +67,7 @@ export interface UsageRecord {
   has_retry?: boolean
   /** codex_turn_state 模块在请求时刻对所用账号的降智判定；无模块数据时为空 */
   turn_state_verdict?: 'normal' | 'suspected' | 'degraded' | null
+  /** 请求所用 (账号, 模型) 当时被探测为降智态（312）；true/false/空 */
+  turn_state_model_degraded?: string | null
   image_progress?: ImageProgress | null
 }

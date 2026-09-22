@@ -1163,6 +1163,8 @@ type HeaderModelTextField =
   | 'reasoning_effort'
   | 'service_tier'
   | 'actual_service_tier'
+  | 'turn_state_verdict'
+  | 'turn_state_model_degraded'
 
 const FINAL_PROVIDER_HEADER_FIELDS = new Set<HeaderModelTextField>([
   'target_model',
@@ -1619,6 +1621,7 @@ const headerModelRecord = computed(() => {
     reasoning_effort: resolveHeaderModelTextField('reasoning_effort', currentDetail),
     service_tier: resolveHeaderModelTextField('service_tier', currentDetail),
     turn_state_verdict: resolveHeaderModelTextField('turn_state_verdict', currentDetail),
+    turn_state_model_degraded: resolveHeaderModelTextField('turn_state_model_degraded', currentDetail),
     error_message: errorMessage,
   }
 })

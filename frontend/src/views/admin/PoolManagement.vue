@@ -319,12 +319,20 @@
                           {{ keyUiStateMap[key.key_id]?.oauthOrgBadge?.label }}
                         </Badge>
                         <Badge
-                          v-if="turnStateDegradedKeyIds.has(key.key_id)"
+                          v-if="turnStateFlagByKeyId.get(key.key_id) === 'degraded'"
                           variant="outline"
                           class="text-[9px] px-1 py-0 h-4 shrink-0 border-destructive/40 bg-destructive/10 text-destructive"
-                          title="该账号被判定降智，处置与恢复见「Codex 状态复用」模块"
+                          title="该账号有模型被降智且无可用 Turn-State 模板，处置与恢复见「Codex 状态复用」模块"
                         >
                           降智
+                        </Badge>
+                        <Badge
+                          v-else-if="turnStateFlagByKeyId.get(key.key_id) === 'partial'"
+                          variant="outline"
+                          class="text-[9px] px-1 py-0 h-4 shrink-0 border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                          title="该账号部分模型被降智且未采到 Turn-State 模板，其余模型已有防护；详见「Codex 状态复用」模块"
+                        >
+                          部分
                         </Badge>
                       </div>
                     </div>
@@ -2557,10 +2565,10 @@ async function loadTurnStateBuckets() {
   }
 }
 
-const turnStateDegradedKeyIds = computed(() => new Set(
+const turnStateFlagByKeyId = computed(() => new Map(
   turnStateAccounts.value
-    .filter(account => account.verdict === 'degraded')
-    .map(account => account.key_id),
+    .map(account => [account.key_id, account.degradation_flag ?? null] as const)
+    .filter((entry): entry is readonly [string, 'degraded' | 'partial'] => entry[1] != null),
 ))
 
 function formatTurnStateTtl(seconds: number | null): string | null {
@@ -2571,16 +2579,30 @@ function formatTurnStateTtl(seconds: number | null): string | null {
 
 const turnStateItemsByKeyId = computed<Record<string, PoolTurnStateDisplayItem[]>>(() => {
   const map: Record<string, PoolTurnStateDisplayItem[]> = {}
+  // 首选账号模型矩阵（覆盖受跟踪的全部模型：手动勾选 ∪ 号池目录），
+  // 矩阵缺失时退回桶列表（模块旧版本兼容）。
+  for (const account of turnStateAccounts.value) {
+    if (account.models?.length) {
+      map[account.key_id] = account.models.map(model => ({
+        model: model.model,
+        ready: model.ready,
+        ttlText: model.ready ? formatTurnStateTtl(model.ttl_remaining_seconds) : null,
+        degraded: model.degraded,
+        unsupported: model.unsupported,
+      }))
+    }
+  }
   for (const bucket of turnStateBuckets.value) {
     if (!map[bucket.key_id]) map[bucket.key_id] = []
-    map[bucket.key_id].push({
+    if (map[bucket.key_id]!.some(item => item.model === bucket.model)) continue
+    map[bucket.key_id]!.push({
       model: bucket.model,
       ready: bucket.ready,
       ttlText: bucket.ready ? formatTurnStateTtl(bucket.ttl_remaining_seconds) : null,
     })
   }
   for (const items of Object.values(map)) {
-    items.sort((a, b) => a.model.localeCompare(b.model))
+    items.sort((a, b) => Number(a.unsupported === true) - Number(b.unsupported === true) || a.model.localeCompare(b.model))
   }
   return map
 })
@@ -3450,7 +3472,9 @@ function getMobileTagItems(key: PoolKeyDetail): PoolMobileTagItem[] {
     authLabel: getAuthTypeChipLabel(key),
     planLabel: planType ? formatOAuthPlanType(planType) : null,
     orgLabel: orgBadge?.label ?? null,
-    degradedLabel: turnStateDegradedKeyIds.value.has(key.key_id) ? '降智' : null,
+    degradedLabel: turnStateFlagByKeyId.value.get(key.key_id) === 'degraded'
+      ? '降智'
+      : turnStateFlagByKeyId.value.get(key.key_id) === 'partial' ? '部分' : null,
     proxyLabel: key.proxy?.node_id ? '独立代理' : null,
   })
 }

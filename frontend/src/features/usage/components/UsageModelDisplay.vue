@@ -89,6 +89,8 @@ interface UsageModelDisplayRecord {
   reasoning_effort?: string | null
   service_tier?: string | null
   turn_state_verdict?: string | null
+  /** 请求所用 (账号, 模型) 当时被探测为降智态；"true"/"false"/空 */
+  turn_state_model_degraded?: string | null
   reasoning_tokens?: number
   error_message?: string | null
 }
@@ -155,14 +157,20 @@ const modelBadges = computed<ModelBadgePresentation[]>(() => {
     })
   }
 
-  if (normalizeText(props.record.turn_state_verdict)?.toLowerCase() === 'degraded') {
+  const accountVerdictDegraded = normalizeText(props.record.turn_state_verdict)?.toLowerCase() === 'degraded'
+  const modelDegraded = normalizeText(props.record.turn_state_model_degraded)?.toLowerCase() === 'true'
+  if (accountVerdictDegraded || modelDegraded) {
     badges.push({
       key: 'degraded',
       label: '降智',
       variant: 'outline',
       className: 'border-destructive/40 bg-destructive/10 text-destructive',
-      title: '该请求所用账号当时被判定降智（详见 Codex 状态复用模块）',
-      ariaLabel: '账号降智',
+      title: accountVerdictDegraded && modelDegraded
+        ? '该请求所用账号被判定降智，且此模型当时处于降智态（详见 Codex 状态复用模块）'
+        : modelDegraded
+          ? '该请求所用 (账号, 模型) 当时被探测为降智态（312）；恢复与替换见「Codex 状态复用」模块'
+          : '该请求所用账号当时被判定降智（详见 Codex 状态复用模块）',
+      ariaLabel: '降智',
     })
   }
 

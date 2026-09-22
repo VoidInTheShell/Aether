@@ -224,20 +224,33 @@
                   {{ account.consecutive_degraded_rounds }} / {{ config.degrade_threshold }}
                 </td>
                 <td class="px-4 py-3">
-                  <div
-                    v-if="account.degraded_models.length"
-                    class="flex flex-wrap gap-1"
-                  >
+                  <div class="flex flex-col gap-1">
+                    <div
+                      v-if="account.degraded_models.length"
+                      class="flex flex-wrap gap-1"
+                    >
+                      <span
+                        v-for="model in account.degraded_models"
+                        :key="model"
+                        class="rounded-md border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 font-mono text-[10px] text-amber-600 dark:text-amber-400"
+                      >{{ model }}</span>
+                    </div>
+                    <div
+                      v-if="account.unsupported_models?.length"
+                      class="flex flex-wrap gap-1"
+                    >
+                      <span
+                        v-for="model in account.unsupported_models"
+                        :key="model"
+                        class="rounded-md border border-border/60 bg-muted/40 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
+                        :title="'上游拒绝该模型（探测 400），已排除出降智分母'"
+                      >⊘ {{ model }}</span>
+                    </div>
                     <span
-                      v-for="model in account.degraded_models"
-                      :key="model"
-                      class="rounded-md border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 font-mono text-[10px] text-amber-600 dark:text-amber-400"
-                    >{{ model }}</span>
+                      v-if="!account.degraded_models.length && !account.unsupported_models?.length"
+                      class="text-xs text-muted-foreground"
+                    >-</span>
                   </div>
-                  <span
-                    v-else
-                    class="text-xs text-muted-foreground"
-                  >-</span>
                 </td>
                 <td class="px-4 py-3 text-[11px] tabular-nums text-muted-foreground">
                   {{ account.last_probe_at_unix ? formatTime(account.last_probe_at_unix) : '-' }}
@@ -525,21 +538,44 @@
           </div>
 
           <div class="space-y-3">
-            <p class="text-sm font-medium text-foreground">
-              模型（{{ scope.models.length }}）
+            <div class="flex items-center justify-between gap-3">
+              <p class="text-sm font-medium text-foreground">
+                模型（{{ scope.models.length }}）
+              </p>
+              <label
+                class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground"
+                title="开启后：生效模型 = 手动勾选 ∪ 号池目录里新增的模型，号池新增模型自动纳入探测与降智跟踪"
+              >
+                <Checkbox
+                  :model-value="scope.auto_follow_catalog ?? true"
+                  @update:model-value="(checked) => scope.auto_follow_catalog = checked === true"
+                />
+                跟随号池目录
+              </label>
+            </div>
+            <p
+              v-if="(scope.auto_follow_catalog ?? true) && catalogModelSet.size > 0"
+              class="text-[11px] leading-4 text-muted-foreground"
+            >
+              已从号池目录同步 {{ catalogModelSet.size }} 个模型（标「目录」若未被手动勾选也会参与探测）；取消勾选单个模型需关闭跟随
             </p>
             <div class="flex flex-wrap gap-2">
               <label
                 v-for="model in availableModels"
                 :key="model"
                 class="flex cursor-pointer items-center gap-2 rounded-lg border border-border px-3 py-1.5 hover:bg-muted/50"
-                :class="scope.models.includes(model) ? 'border-primary/50 bg-primary/5' : ''"
+                :class="scope.models.includes(model) || ((scope.auto_follow_catalog ?? true) && catalogModelSet.has(model)) ? 'border-primary/50 bg-primary/5' : ''"
               >
                 <Checkbox
-                  :model-value="scope.models.includes(model)"
+                  :model-value="scope.models.includes(model) || ((scope.auto_follow_catalog ?? true) && catalogModelSet.has(model))"
+                  :disabled="(scope.auto_follow_catalog ?? true) && catalogModelSet.has(model) && !scope.models.includes(model)"
                   @update:model-value="(checked) => toggleScopeModel(model, checked === true)"
                 />
                 <span class="font-mono text-xs">{{ model }}</span>
+                <span
+                  v-if="!scope.models.includes(model) && catalogModelSet.has(model)"
+                  class="rounded border border-primary/30 bg-primary/5 px-1 py-0 text-[9px] leading-3 text-primary"
+                >目录</span>
               </label>
             </div>
             <div class="flex items-center gap-2">
@@ -998,7 +1034,7 @@ const saving = ref(false)
 const status = ref<TurnStateStatus | null>(null)
 const config = ref<TurnStateConfig>({ ...DEFAULT_CONFIG })
 const originalConfigJson = ref('')
-const scope = ref<TurnStateScope>({ key_ids: [], models: [], probe_proxies: [], probe_proxies_rotating: [] })
+const scope = ref<TurnStateScope>({ key_ids: [], models: [], auto_follow_catalog: true, probe_proxies: [], probe_proxies_rotating: [] })
 const originalScopeJson = ref('')
 const staticProxyText = ref('')
 const rotatingProxyText = ref('')
@@ -1049,7 +1085,7 @@ const accounts = computed(() => status.value?.accounts ?? [])
 // 账号状态分页：与探测队列同序（降智 > 疑似 > 正常），同级按账号名字典序，翻页稳定
 const accountPage = ref(1)
 const accountPageSize = ref(10)
-const verdictRank: Record<TurnStateAccountVerdict, number> = { degraded: 0, suspected: 1, normal: 2 }
+const verdictRank: Record<TurnStateAccountVerdict, number> = { degraded: 0, suspected: 1, normal: 2, unknown: 3 }
 const sortedAccounts = computed(() => [...accounts.value].sort((a, b) => {
   if (verdictRank[a.verdict] !== verdictRank[b.verdict]) return verdictRank[a.verdict] - verdictRank[b.verdict]
   return a.key_name.localeCompare(b.key_name) || a.key_id.localeCompare(b.key_id)
@@ -1067,6 +1103,7 @@ const verdictMeta: Record<TurnStateAccountVerdict, { label: string; dotClass: st
   normal: { label: '正常', dotClass: 'bg-emerald-500', textClass: 'text-emerald-600 dark:text-emerald-400' },
   suspected: { label: '疑似降智', dotClass: 'bg-amber-500', textClass: 'text-amber-600 dark:text-amber-400' },
   degraded: { label: '降智中', dotClass: 'bg-destructive', textClass: 'text-destructive' },
+  unknown: { label: '未探测', dotClass: 'bg-muted-foreground/40', textClass: 'text-muted-foreground' },
 }
 
 const degradeActionLabels: Record<TurnStateDegradeAction, string> = {
@@ -1120,13 +1157,17 @@ watch(() => availableKeys.value.length, (total) => {
   if (scopeKeyPage.value > maxPage) scopeKeyPage.value = maxPage
 })
 
-/** 可选模型 = 桶矩阵 ∪ 已保存范围 */
+/** 可选模型 = 生效模型集（手动勾选 ∪ 号池目录）∪ 桶矩阵；目录来源打同步标签 */
 const availableModels = computed(() => {
   const models = new Set<string>()
+  for (const model of status.value?.effective_models ?? []) models.add(model)
   for (const bucket of buckets.value) models.add(bucket.model)
   for (const model of scope.value.models) models.add(model)
   return [...models].sort()
 })
+
+/** 目录同步来源（auto-follow 从号池目录拉进来的模型） */
+const catalogModelSet = computed(() => new Set(status.value?.catalog_models ?? []))
 
 const staticProxyLines = computed(() => staticProxyText.value.split('\n').map(line => line.trim()).filter(Boolean))
 const rotatingProxyLines = computed(() => rotatingProxyText.value.split('\n').map(line => line.trim()).filter(Boolean))
@@ -1158,12 +1199,13 @@ function sameStringList(left: string[], right: string[]): boolean {
   return JSON.stringify([...left].sort()) === JSON.stringify([...right].sort())
 }
 
-/** 账号与模型卡的脏检查：只看 key_ids / models */
+/** 账号与模型卡的脏检查：只看 key_ids / models / auto_follow_catalog */
 const accountCardDirty = computed(() => {
   const original = originalScope.value
   if (!original) return false
   return !sameStringList(scope.value.key_ids, original.key_ids ?? [])
     || !sameStringList(scope.value.models, original.models ?? [])
+    || (scope.value.auto_follow_catalog ?? true) !== (original.auto_follow_catalog ?? true)
 })
 
 /** 代理配置卡的脏检查：只看两个出口池 */
@@ -1183,6 +1225,7 @@ function currentScopePayload(): TurnStateScope {
   return {
     key_ids: [...scope.value.key_ids],
     models: [...scope.value.models],
+    auto_follow_catalog: scope.value.auto_follow_catalog ?? true,
     probe_proxies: staticProxyLines.value,
     probe_proxies_rotating: rotatingProxyLines.value,
   }

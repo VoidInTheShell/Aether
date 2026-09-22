@@ -94,7 +94,11 @@ pub fn sanitize_usage_request_metadata_object(source: &Map<String, Value>) -> Op
     ] {
         insert_known_string(source, &mut target, key, sanitize_service_tier);
     }
-    for key in ["turn_state_verdict", "turn_state_action"] {
+    for key in [
+        "turn_state_verdict",
+        "turn_state_action",
+        "turn_state_model_degraded",
+    ] {
         insert_known_string(source, &mut target, key, sanitize_turn_state_value);
     }
     insert_bounded_u64(

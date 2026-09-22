@@ -62,9 +62,32 @@ export interface TurnStateProbeRun {
 /**
  * 账号级降智判定（聚合 (账号 × 模型) 桶的探测结果）：
  * normal = 正常；suspected = 有桶连续采到 312 但未达阈值；degraded = 达到
- * degrade_threshold，已按 degrade_action 处置。采到 292 自动恢复 normal。
+ * degrade_threshold，已按 degrade_action 处置；unknown = 尚未探测过。
+ * 采到 292 自动恢复 normal。
  */
-export type TurnStateAccountVerdict = 'normal' | 'suspected' | 'degraded'
+export type TurnStateAccountVerdict = 'normal' | 'suspected' | 'degraded' | 'unknown'
+
+/**
+ * 号池展示用的账号级降智标志（按模型矩阵聚合，与 verdict 相互独立）：
+ * degraded = 有模型被降智且账号一个可用模板都没有；
+ * partial = 有模型被降智且无保护，但至少还有一个模型有可用模板；
+ * null = 未被降智，或所有受跟踪模型都有可用模板（全防护）。
+ */
+export type TurnStateDegradationFlag = 'degraded' | 'partial' | null
+
+/** 账号 × 模型矩阵单元（仅状态，不含桶值） */
+export interface TurnStateAccountModelHealth {
+  model: string
+  /** 桶内有未过期的正常态（292） */
+  ready: boolean
+  ttl_remaining_seconds: number | null
+  /** 探测观察到 312（降智态）且未恢复 */
+  degraded: boolean
+  /** 上游拒绝该模型（探测 400/404），不可能有模板也不计入降智分母 */
+  unsupported: boolean
+  /** 模型来源：manual = 模块设置手动勾选；catalog = 号池目录同步；bucket = 遗留桶 */
+  source: 'manual' | 'catalog' | 'bucket'
+}
 
 export interface TurnStateAccountHealth {
   key_id: string
@@ -74,9 +97,15 @@ export interface TurnStateAccountHealth {
   consecutive_degraded_rounds: number
   /** 当前采不到正常态的模型（空桶且探测失败） */
   degraded_models: string[]
+  /** 上游不支持的模型（探测 400/404），不计入降智分母 */
+  unsupported_models?: string[]
   last_probe_at_unix: number | null
   /** 被判 degraded 的起始时间；未判定为 null */
   degraded_since_unix: number | null
+  /** 受跟踪模型的状态矩阵（号池展示用） */
+  models?: TurnStateAccountModelHealth[]
+  /** 号池展示用的降智标志（degraded/partial/null） */
+  degradation_flag?: TurnStateDegradationFlag
 }
 
 export interface TurnStateStatus {
@@ -85,6 +114,10 @@ export interface TurnStateStatus {
   buckets: TurnStateBucket[]
   /** 账号级降智判定：当前是否被降智看这里，桶矩阵看明细 */
   accounts: TurnStateAccountHealth[]
+  /** 生效模型集（手动勾选 ∪ 号池目录，auto_follow_catalog 开启时） */
+  effective_models?: string[]
+  /** 号池目录里的模型（auto-follow 的同步来源） */
+  catalog_models?: string[]
   counters: TurnStateCounters
   counters_since_unix: number
   probe_run: TurnStateProbeRun
@@ -95,6 +128,8 @@ export interface TurnStateScope {
   key_ids: string[]
   /** 目标模型清单（必须带横线） */
   models: string[]
+  /** 自动跟随号池目录：生效模型 = models ∪ 号池目录模型（默认开） */
+  auto_follow_catalog?: boolean
   /** 静态出口池：一条 URL = 一个固定 IP，每桶每条 55 分钟一次机会 */
   probe_proxies: string[]
   /** 轮换出口池：一条 URL = 住宅网关，每次连接换地址，每桶同一条可连试 */

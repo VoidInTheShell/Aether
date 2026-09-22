@@ -89,6 +89,10 @@ export interface PoolTurnStateDisplayItem {
   ready: boolean
   /** 已格式化的剩余有效期，如 "47 分钟"；空桶为 null */
   ttlText: string | null
+  /** 该模型被探测到降智（312）且未恢复 */
+  degraded?: boolean
+  /** 上游拒绝该模型（探测 400/404），不可能有模板 */
+  unsupported?: boolean
 }
 
 const props = withDefaults(defineProps<{
@@ -155,25 +159,43 @@ const TurnStateRows = defineComponent({
     },
   },
   setup() {
+    const countedItems = () => props.turnStateItems.filter(item => !item.unsupported)
+    const countedReady = () => countedItems().filter(item => item.ready).length
     return () => props.turnStateItems.length ? h('div', {
       'data-testid': 'pool-turn-state-rows',
       class: 'mt-2 border-t border-border/50 pt-1.5 text-[10px] leading-4 text-muted-foreground',
     }, [
       h('div', { class: 'mb-1 flex items-center justify-between' }, [
         h('span', legacyT('Turn-State')),
-        h('span', { class: 'tabular-nums' }, `${props.turnStateItems.filter(item => item.ready).length}/${props.turnStateItems.length} ${legacyT('就绪')}`),
+        h('span', { class: 'tabular-nums' }, `${countedReady()}/${countedItems().length} ${legacyT('就绪')}${props.turnStateItems.some(item => item.unsupported) ? ` · ${props.turnStateItems.filter(item => item.unsupported).length} ${legacyT('不支持')}` : ''}`),
       ]),
-      h('div', { class: 'flex flex-wrap gap-1' }, props.turnStateItems.map(item => h('span', {
-        key: item.model,
-        'data-testid': 'pool-turn-state-chip',
-        title: item.ready ? `${item.model} · ${legacyT('剩余')} ${item.ttlText}` : `${item.model} · ${legacyT('空桶')}`,
-        class: [
-          'inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-mono tabular-nums',
-          item.ready
+      h('div', { class: 'flex flex-wrap gap-1' }, props.turnStateItems.map(item => {
+        // 绿 = 有可用模板；红 = 该模型降智且无模板；灰红 = 无模板但未见降智；灰 = 上游不支持
+        const chipClass = item.unsupported
+          ? 'border-border/60 bg-muted/40 text-muted-foreground/70'
+          : item.ready
             ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-            : 'border-border/60 bg-background/60 text-muted-foreground',
-        ],
-      }, `${shortModelName(item.model)} ${item.ready ? `✓${item.ttlText ? ` ${item.ttlText}` : ''}` : '—'}`))),
+            : item.degraded
+              ? 'border-destructive/40 bg-destructive/10 text-destructive'
+              : 'border-rose-500/30 bg-rose-500/5 text-rose-600 dark:text-rose-400'
+        const title = item.unsupported
+          ? `${item.model} · ${legacyT('上游不支持该模型（探测 400）')}`
+          : item.ready
+            ? `${item.model} · ${legacyT('剩余')} ${item.ttlText}`
+            : item.degraded
+              ? `${item.model} · ${legacyT('被探测到降智，暂无可用模板')}`
+              : `${item.model} · ${legacyT('暂无模板')}`
+        const mark = item.unsupported ? '⊘' : item.ready ? '✓' : item.degraded ? '✗' : '—'
+        return h('span', {
+          key: item.model,
+          'data-testid': 'pool-turn-state-chip',
+          title,
+          class: [
+            'inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-mono tabular-nums',
+            chipClass,
+          ],
+        }, `${shortModelName(item.model)} ${mark}${item.ready && item.ttlText ? ` ${item.ttlText}` : ''}`)
+      })),
     ]) : null
   },
 })

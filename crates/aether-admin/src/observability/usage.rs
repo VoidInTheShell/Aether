@@ -1364,6 +1364,11 @@ fn admin_usage_active_request_json(
     if let Some(turn_state_verdict) = admin_usage_metadata_string(item, "turn_state_verdict") {
         value["turn_state_verdict"] = json!(turn_state_verdict);
     }
+    if let Some(turn_state_model_degraded) =
+        admin_usage_metadata_string(item, "turn_state_model_degraded")
+    {
+        value["turn_state_model_degraded"] = json!(turn_state_model_degraded);
+    }
     if let Some(turn_state_action) = admin_usage_metadata_string(item, "turn_state_action") {
         value["turn_state_action"] = json!(turn_state_action);
     }
@@ -1533,6 +1538,11 @@ pub fn admin_usage_record_json(
         object,
         "turn_state_verdict",
         admin_usage_metadata_string(item, "turn_state_verdict"),
+    );
+    maybe_insert_string_field(
+        object,
+        "turn_state_model_degraded",
+        admin_usage_metadata_string(item, "turn_state_model_degraded"),
     );
     maybe_insert_string_field(
         object,

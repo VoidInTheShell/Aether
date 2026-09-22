@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -9,11 +9,12 @@ use aether_crypto::{decrypt_python_fernet_ciphertext, encrypt_python_fernet_plai
 use aether_data_contracts::repository::codex_turn_state::{
     CodexTurnStateSource, StoredCodexTurnStateBucket, UpsertCodexTurnStateBucket,
 };
+use aether_data_contracts::repository::global_models::AdminProviderModelListQuery;
 use aether_data_contracts::repository::provider_catalog::ProviderCatalogKeyHealthStateUpdate;
 use aether_turn_state::{
-    decide_header, issued_at_unix_secs, template_usable, AccountVerdict, AccountVerdictState,
-    DecisionAction, InjectMode, LiveTemplate, TurnStateDecisionInput, VerdictTransition,
-    DEFAULT_REPLACE_LENGTH, DEFAULT_TEMPLATE_LENGTH, DEFAULT_TTL_SECONDS,
+    decide_header, degradation_flag, issued_at_unix_secs, template_usable, AccountVerdict,
+    AccountVerdictState, DecisionAction, InjectMode, LiveTemplate, TurnStateDecisionInput,
+    VerdictTransition, DEFAULT_REPLACE_LENGTH, DEFAULT_TEMPLATE_LENGTH, DEFAULT_TTL_SECONDS,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::StreamExt;
@@ -225,13 +226,60 @@ impl TurnStateConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct TurnStateScope {
     pub key_ids: Vec<String>,
     pub models: Vec<String>,
     pub probe_proxies: Vec<String>,
     pub probe_proxies_rotating: Vec<String>,
+    /// Follow the provider catalog automatically: the effective model set is
+    /// `models` ∪ (active catalog models of the scope keys' providers).  A
+    /// model added to the pool catalog is tracked without editing this scope.
+    pub auto_follow_catalog: bool,
+}
+
+fn default_scope_auto_follow_catalog() -> bool {
+    true
+}
+
+/// Per-key and per-provider view of the pool model catalog, used to derive
+/// the effective model set (auto-follow) and the per-account model matrix.
+#[derive(Debug, Default)]
+struct CatalogModelIndex {
+    /// key_id -> provider_id
+    key_provider: BTreeMap<String, String>,
+    /// provider_id -> active provider model names
+    provider_models: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl CatalogModelIndex {
+    fn all_models(&self) -> impl Iterator<Item = String> + '_ {
+        self.provider_models
+            .values()
+            .flat_map(|models| models.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+    }
+
+    /// The catalog models visible to one account (its provider's models).
+    fn models_for_key(&self, key_id: &str) -> Option<&BTreeSet<String>> {
+        self.key_provider
+            .get(key_id)
+            .and_then(|provider_id| self.provider_models.get(provider_id))
+    }
+}
+
+impl Default for TurnStateScope {
+    fn default() -> Self {
+        Self {
+            key_ids: Vec::new(),
+            models: Vec::new(),
+            probe_proxies: Vec::new(),
+            probe_proxies_rotating: Vec::new(),
+            auto_follow_catalog: default_scope_auto_follow_catalog(),
+        }
+    }
 }
 
 impl TurnStateScope {
@@ -271,6 +319,7 @@ impl TurnStateScope {
                 .iter()
                 .map(|value| mask_proxy(value))
                 .collect(),
+            auto_follow_catalog: self.auto_follow_catalog,
         }
     }
 }
@@ -386,6 +435,10 @@ enum ProbeOneOutcome {
         exit: Option<String>,
     },
     AccountLimited(u16),
+    /// The upstream rejects this model outright (probe 400/404, e.g. a bare
+    /// model name that cannot be used with a ChatGPT account).  Model-level
+    /// and deterministic, so no other exit is worth trying.
+    Unsupported,
     Skipped(String),
 }
 
@@ -524,6 +577,8 @@ impl TurnStateRuntime {
                             continue;
                         };
                         let due_keys = {
+                            let effective_models =
+                                runtime.effective_probe_models(&app, &scope).await;
                             let memory = runtime.memory.read().await;
                             // A missing bucket never appears in the map, so the
                             // due set is derived from the configured scope: a
@@ -537,7 +592,7 @@ impl TurnStateRuntime {
                                 if key_id.is_empty() {
                                     continue;
                                 }
-                                for model in &scope.models {
+                                for model in &effective_models {
                                     let model = model.trim();
                                     if model.is_empty() {
                                         continue;
@@ -802,6 +857,100 @@ impl TurnStateRuntime {
             .unwrap_or_default())
     }
 
+    /// The catalog models of the providers that own the given keys, used both
+    /// for the effective probe set (auto-follow) and for the per-account model
+    /// matrix in the status payload.
+    async fn catalog_models_for_keys(
+        &self,
+        app: &AppState,
+        key_ids: &[String],
+    ) -> CatalogModelIndex {
+        let mut key_provider: BTreeMap<String, String> = BTreeMap::new();
+        if !key_ids.is_empty() {
+            match app
+                .read_provider_catalog_keys_by_ids(&key_ids.to_vec())
+                .await
+            {
+                Ok(keys) => {
+                    for key in keys {
+                        if !key.provider_id.is_empty() {
+                            key_provider.insert(key.id, key.provider_id);
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        event_name = "codex_turn_state_catalog_keys_read_failed",
+                        log_type = "ops",
+                        error = ?err,
+                        "turn-state failed to read scope keys for catalog model sync"
+                    );
+                }
+            }
+        }
+        let provider_ids: BTreeSet<String> = key_provider.values().cloned().collect();
+        let mut provider_models: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for provider_id in &provider_ids {
+            match app
+                .data
+                .list_admin_provider_models(&AdminProviderModelListQuery {
+                    provider_id: provider_id.clone(),
+                    is_active: Some(true),
+                    offset: 0,
+                    limit: 10_000,
+                })
+                .await
+            {
+                Ok(entries) => {
+                    let models = provider_models.entry(provider_id.clone()).or_default();
+                    for entry in entries {
+                        let name = entry.provider_model_name.trim();
+                        if !name.is_empty() {
+                            models.insert(name.to_string());
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        event_name = "codex_turn_state_catalog_models_read_failed",
+                        log_type = "ops",
+                        provider_id = %provider_id,
+                        error = ?err,
+                        "turn-state failed to read provider catalog models"
+                    );
+                }
+            }
+        }
+        CatalogModelIndex {
+            key_provider,
+            provider_models,
+        }
+    }
+
+    /// The effective probe/track model set: manually scoped models, plus the
+    /// providers' active catalog models when `auto_follow_catalog` is on.
+    /// Sorted and deduplicated.  Catalog reads are best-effort — on failure
+    /// the set falls back to the manual scope list.
+    async fn effective_probe_models(&self, app: &AppState, scope: &TurnStateScope) -> Vec<String> {
+        let mut models: Vec<String> = scope
+            .models
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
+        if scope.auto_follow_catalog {
+            let index = self.catalog_models_for_keys(app, &scope.key_ids).await;
+            for model in index.all_models() {
+                if !models.contains(&model) {
+                    models.push(model);
+                }
+            }
+        }
+        models.sort();
+        models.dedup();
+        models
+    }
+
     pub(crate) async fn scope(&self, app: &AppState) -> Result<TurnStateScope, GatewayError> {
         Ok(self.scope_raw(app).await?.masked())
     }
@@ -959,7 +1108,8 @@ impl TurnStateRuntime {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .collect::<Vec<_>>();
-        let total = key_ids.len().saturating_mul(scope.models.len());
+        let models = self.effective_probe_models(app, &scope).await;
+        let total = key_ids.len().saturating_mul(models.len());
         {
             let mut memory = self.memory.write().await;
             if memory.probe_run.running {
@@ -1081,14 +1231,10 @@ impl TurnStateRuntime {
             });
         }
         key_ids.dedup();
-        let mut models = scope
-            .models
-            .iter()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>();
-        models.sort();
-        models.dedup();
+        // The effective model set includes provider catalog models when
+        // auto-follow is enabled, so newly added pool models are tracked
+        // without editing the scope.
+        let models = self.effective_probe_models(app, &scope).await;
 
         let config = self.config(app).await?;
         let concurrency = config.max_accounts_in_flight.max(1) as usize;
@@ -1134,6 +1280,24 @@ impl TurnStateRuntime {
             if !self.probe_is_running().await {
                 return Ok(());
             }
+            // A model the upstream rejects outright (probe 400/404) can never
+            // carry a template nor be degraded; skip it without spending a
+            // single upstream request.  The mark clears itself the moment a
+            // 292/312 is observed for the model.
+            let unsupported = {
+                let memory = self.memory.read().await;
+                memory
+                    .accounts
+                    .get(key_id)
+                    .is_some_and(|state| state.unsupported_models.iter().any(|item| item == model))
+            };
+            if unsupported {
+                observation.all_models_degraded = false;
+                round_complete = false;
+                self.advance_probe(app, format!("{key_id}/{model}: 上游不支持，跳过"))
+                    .await?;
+                continue;
+            }
             // A bucket that is still comfortably live needs no probe: firing
             // anyway would only burn upstream quota (the reference plugin's
             // pending-target list holds missing/expired buckets only).  The
@@ -1172,6 +1336,7 @@ impl TurnStateRuntime {
                         exit.clone(),
                     )
                     .await?;
+                    self.mark_model_supported(app, key_id, model).await;
                     round_observed = true;
                     observation.all_models_degraded = false;
                     observation.recovered_models.push(model.clone());
@@ -1187,6 +1352,7 @@ impl TurnStateRuntime {
                     .await?;
                 }
                 ProbeOneOutcome::Degraded { exit } => {
+                    self.mark_model_supported(app, key_id, model).await;
                     round_observed = true;
                     observation.degraded_models.push(model.clone());
                     self.advance_probe(
@@ -1197,6 +1363,26 @@ impl TurnStateRuntime {
                                 .map(|value| format!(" via {value}"))
                                 .unwrap_or_default()
                         ),
+                    )
+                    .await?;
+                }
+                ProbeOneOutcome::Unsupported => {
+                    // The upstream rejects this model outright (400/404): mark
+                    // it so later rounds skip it entirely, and keep it out of
+                    // the degraded-round state machine.
+                    {
+                        let mut memory = self.memory.write().await;
+                        memory
+                            .accounts
+                            .entry(key_id.to_string())
+                            .or_default()
+                            .mark_model_unsupported(model);
+                    }
+                    observation.all_models_degraded = false;
+                    round_complete = false;
+                    self.advance_probe(
+                        app,
+                        format!("{key_id}/{model}: 上游不支持该模型（400），已标记跳过"),
                     )
                     .await?;
                 }
@@ -1264,6 +1450,30 @@ impl TurnStateRuntime {
             );
         }
         Ok(())
+    }
+
+    /// Clear the unsupported mark for a model the probe walk just proved
+    /// supported (any 292/312 response means the upstream accepts it).
+    async fn mark_model_supported(&self, app: &AppState, key_id: &str, model: &str) {
+        let changed = {
+            let mut memory = self.memory.write().await;
+            memory
+                .accounts
+                .entry(key_id.to_string())
+                .or_default()
+                .mark_model_supported(model)
+        };
+        if changed {
+            if let Err(err) = self.persist(app).await {
+                warn!(
+                    event_name = "codex_turn_state_round_persist_failed",
+                    log_type = "ops",
+                    key_id = %key_id,
+                    error = ?err,
+                    "turn-state failed to persist unsupported-mark clear"
+                );
+            }
+        }
     }
 
     async fn project_probe_auth_failure(
@@ -1641,6 +1851,9 @@ impl TurnStateRuntime {
                     )
                     .await;
                 }
+                ProbeResponse::UpstreamFailure(status) if matches!(status, 400 | 404) => {
+                    return ProbeOneOutcome::Unsupported;
+                }
                 ProbeResponse::NoTurnState
                 | ProbeResponse::UnknownLength(_)
                 | ProbeResponse::UpstreamFailure(_) => {
@@ -1711,6 +1924,9 @@ impl TurnStateRuntime {
                         .await;
                         return ProbeOneOutcome::AccountLimited(status);
                     }
+                    ProbeResponse::UpstreamFailure(status) if matches!(status, 400 | 404) => {
+                        return ProbeOneOutcome::Unsupported;
+                    }
                     ProbeResponse::NetworkFailure
                     | ProbeResponse::NoTurnState
                     | ProbeResponse::UnknownLength(_)
@@ -1773,6 +1989,9 @@ impl TurnStateRuntime {
                         ),
                     )
                     .await;
+                }
+                ProbeResponse::UpstreamFailure(status) if matches!(status, 400 | 404) => {
+                    return ProbeOneOutcome::Unsupported;
                 }
                 ProbeResponse::NoTurnState
                 | ProbeResponse::UnknownLength(_)
@@ -2283,6 +2502,7 @@ impl TurnStateRuntime {
         self.ensure_loaded(app).await?;
         let config = self.config(app).await?;
         let now = current_unix_secs();
+        let scope = self.scope_raw(app).await?;
         let memory = self.memory.read().await.clone();
         let mut key_ids = std::collections::BTreeSet::new();
         for key in memory.buckets.keys() {
@@ -2291,6 +2511,31 @@ impl TurnStateRuntime {
             }
         }
         key_ids.extend(memory.accounts.keys().cloned());
+        key_ids.extend(
+            scope
+                .key_ids
+                .iter()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        );
+        let catalog_index = self.catalog_models_for_keys(app, &scope.key_ids).await;
+        let manual_models: BTreeSet<String> = scope
+            .models
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
+        let effective_models: Vec<String> = {
+            let mut models = manual_models.clone();
+            if scope.auto_follow_catalog {
+                models.extend(catalog_index.all_models());
+            }
+            models
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
         let key_names = if key_ids.is_empty() {
             BTreeMap::new()
         } else {
@@ -2331,18 +2576,106 @@ impl TurnStateRuntime {
                 "last_exit": bucket.last_exit,
             }));
         }
-        let accounts = memory
-            .accounts
+        let accounts = key_ids
             .iter()
-            .map(|(key_id, state)| {
+            .map(|key_id| {
+                let state = memory.accounts.get(key_id);
+                // Per-account model matrix over the tracked set (scope ∪
+                // catalog ∪ leftover buckets), so the pool display can paint
+                // each model green (has usable template) or red (missing).
+                // Collect (model, source) pairs first: the entry builder
+                // mutably owns the matrix, so membership checks stay outside.
+                let provider_models = catalog_index.models_for_key(key_id);
+                let mut matrix_models: Vec<(String, &'static str)> = Vec::new();
+                for model in &effective_models {
+                    // Only models this account's provider actually offers (or
+                    // that were manually scoped, or that already hold a
+                    // bucket) belong in this account's matrix — with several
+                    // codex providers a sibling provider's model must not
+                    // paint this account red.
+                    let in_provider =
+                        provider_models.is_some_and(|set| set.contains(model));
+                    let manual = manual_models.contains(model);
+                    let has_bucket = memory
+                        .buckets
+                        .contains_key(bucket_key(key_id, model).as_str());
+                    if !manual && !in_provider && !has_bucket {
+                        continue;
+                    }
+                    matrix_models
+                        .push((model.clone(), if manual { "manual" } else { "catalog" }));
+                }
+                // Buckets for models that are no longer tracked still carry
+                // usable state; show them so passive harvests stay visible.
+                for key in memory.buckets.keys() {
+                    if let Some((bucket_key_id, model)) =
+                        key.split_once(TURN_STATE_KEY_SEPARATOR)
+                    {
+                        if bucket_key_id == key_id
+                            && !matrix_models.iter().any(|(known, _)| known == model)
+                        {
+                            matrix_models.push((model.to_string(), "bucket"));
+                        }
+                    }
+                }
+                let mut matrix: BTreeMap<String, Value> = BTreeMap::new();
+                for (model, source) in matrix_models {
+                    let bucket = memory.buckets.get(bucket_key(key_id, model.as_str()).as_str());
+                    let ready = bucket.is_some_and(|bucket| {
+                        bucket.value.len() == config.template_length
+                            && template_usable(
+                                bucket.issued_at_unix,
+                                now,
+                                config.ttl_seconds,
+                            )
+                    });
+                    let degraded = state.is_some_and(|state| {
+                        state.degraded_models.iter().any(|item| item == &model)
+                    });
+                    let unsupported = state.is_some_and(|state| {
+                        state.unsupported_models.iter().any(|item| item == &model)
+                    });
+                    matrix.insert(
+                        model.clone(),
+                        json!({
+                            "model": model,
+                            "ready": ready,
+                            "ttl_remaining_seconds": bucket
+                                .filter(|_| ready)
+                                .map(|bucket| bucket.expires_at_unix.saturating_sub(now)),
+                            "degraded": degraded,
+                            "unsupported": unsupported,
+                            "source": source,
+                        }),
+                    );
+                }
+                let tracked_models: Vec<String> = matrix.keys().cloned().collect();
+                let ready_models: Vec<String> = matrix
+                    .iter()
+                    .filter(|(_, entry)| {
+                        entry.get("ready").and_then(Value::as_bool).unwrap_or(false)
+                    })
+                    .map(|(model, _)| model.clone())
+                    .collect();
+                let flag = degradation_flag(
+                    &tracked_models,
+                    &state.map(|state| state.degraded_models.clone()).unwrap_or_default(),
+                    &ready_models,
+                    &state
+                        .map(|state| state.unsupported_models.clone())
+                        .unwrap_or_default(),
+                );
                 json!({
                     "key_id": key_id,
                     "key_name": key_name(key_id),
-                    "verdict": verdict_name(state.verdict),
-                    "consecutive_degraded_rounds": state.consecutive_degraded_rounds,
-                    "degraded_models": state.degraded_models,
-                    "last_probe_at_unix": state.last_probe_at_unix_secs,
-                    "degraded_since_unix": state.degraded_since_unix_secs,
+                    "verdict": state.map(|state| verdict_name(state.verdict)).unwrap_or("unknown"),
+                    "consecutive_degraded_rounds": state.map(|state| state.consecutive_degraded_rounds).unwrap_or(0),
+                    "degraded_models": state.map(|state| state.degraded_models.clone()).unwrap_or_default(),
+                    "unsupported_models": state.map(|state| state.unsupported_models.clone()).unwrap_or_default(),
+                    "last_probe_at_unix": state.and_then(|state| state.last_probe_at_unix_secs),
+                    "degraded_since_unix": state.and_then(|state| state.degraded_since_unix_secs),
+                    "models": matrix.into_values().collect::<Vec<_>>(),
+                    "degradation_flag": flag,
                 })
             })
             .collect::<Vec<_>>();
@@ -2351,6 +2684,8 @@ impl TurnStateRuntime {
             "dry_run": config.dry_run,
             "buckets": buckets,
             "accounts": accounts,
+            "effective_models": effective_models,
+            "catalog_models": catalog_index.all_models().collect::<Vec<_>>(),
             "counters": {
                 "harvest": memory.counters.harvest,
                 "substitute": memory.counters.substitute,
@@ -2436,20 +2771,33 @@ impl TurnStateRuntime {
                     .insert("x-codex-turn-state".to_string(), replacement.to_string());
             }
         }
-        let verdict = self
-            .memory
-            .read()
-            .await
-            .accounts
-            .get(&key_id)
-            .map(|state| verdict_name(state.verdict));
-        merge_report_context(
-            report_context,
-            "turn_state_verdict",
-            verdict
-                .map(|value| Value::String(value.to_string()))
-                .unwrap_or(Value::Null),
-        );
+        let account_state = {
+            let memory = self.memory.read().await;
+            memory.accounts.get(&key_id).map(|state| {
+                (
+                    verdict_name(state.verdict),
+                    state.degraded_models.iter().any(|item| item == &model),
+                )
+            })
+        };
+        match account_state {
+            Some((verdict, model_degraded)) => {
+                merge_report_context(
+                    report_context,
+                    "turn_state_verdict",
+                    Value::String(verdict.to_string()),
+                );
+                merge_report_context(
+                    report_context,
+                    "turn_state_model_degraded",
+                    Value::String(model_degraded.to_string()),
+                );
+            }
+            None => {
+                merge_report_context(report_context, "turn_state_verdict", Value::Null);
+                merge_report_context(report_context, "turn_state_model_degraded", Value::Null);
+            }
+        }
         merge_report_context(
             report_context,
             "turn_state_action",
@@ -2538,11 +2886,9 @@ impl TurnStateRuntime {
             // A valid 292 is a recovery signal even when its Fernet timestamp
             // is older than the bucket already held.  Bucket CAS and verdict
             // recovery are intentionally independent state transitions.
-            recovered = memory
-                .accounts
-                .entry(key_id.to_string())
-                .or_default()
-                .recover_model(model, now);
+            let entry = memory.accounts.entry(key_id.to_string()).or_default();
+            entry.mark_model_supported(model);
+            recovered = entry.recover_model(model, now);
         }
         if recovered {
             let config = self.config(app).await?;

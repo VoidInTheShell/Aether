@@ -19,4 +19,6 @@ pub use decide::{
 };
 pub use fernet::{issued_at_unix_secs, template_usable, FernetTimestampError};
 pub use schedule::{classify_probe_response, ProbeAttribution, ProbeCooldown};
-pub use verdict::{AccountVerdict, AccountVerdictState, ProbeRoundObservation, VerdictTransition};
+pub use verdict::{
+    degradation_flag, AccountVerdict, AccountVerdictState, ProbeRoundObservation, VerdictTransition,
+};

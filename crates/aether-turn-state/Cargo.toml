@@ -10,3 +10,6 @@ description = "Pure Codex X-Codex-Turn-State decision and probe policy"
 base64.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
