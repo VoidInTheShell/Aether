@@ -867,10 +867,7 @@ impl TurnStateRuntime {
     ) -> CatalogModelIndex {
         let mut key_provider: BTreeMap<String, String> = BTreeMap::new();
         if !key_ids.is_empty() {
-            match app
-                .read_provider_catalog_keys_by_ids(&key_ids.to_vec())
-                .await
-            {
+            match app.read_provider_catalog_keys_by_ids(key_ids).await {
                 Ok(keys) => {
                     for key in keys {
                         if !key.provider_id.is_empty() {
@@ -1851,7 +1848,7 @@ impl TurnStateRuntime {
                     )
                     .await;
                 }
-                ProbeResponse::UpstreamFailure(status) if matches!(status, 400 | 404) => {
+                ProbeResponse::UpstreamFailure(400 | 404) => {
                     return ProbeOneOutcome::Unsupported;
                 }
                 ProbeResponse::NoTurnState
@@ -1924,7 +1921,7 @@ impl TurnStateRuntime {
                         .await;
                         return ProbeOneOutcome::AccountLimited(status);
                     }
-                    ProbeResponse::UpstreamFailure(status) if matches!(status, 400 | 404) => {
+                    ProbeResponse::UpstreamFailure(400 | 404) => {
                         return ProbeOneOutcome::Unsupported;
                     }
                     ProbeResponse::NetworkFailure
@@ -1990,7 +1987,7 @@ impl TurnStateRuntime {
                     )
                     .await;
                 }
-                ProbeResponse::UpstreamFailure(status) if matches!(status, 400 | 404) => {
+                ProbeResponse::UpstreamFailure(400 | 404) => {
                     return ProbeOneOutcome::Unsupported;
                 }
                 ProbeResponse::NoTurnState
