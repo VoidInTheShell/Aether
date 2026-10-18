@@ -36,10 +36,13 @@ jobs:
       short_sha: ${{ steps.snapshot.outputs.short_sha }}
       date: ${{ steps.snapshot.outputs.date }}
       ghcr_image: ${{ steps.snapshot.outputs.ghcr_image }}
+      skip: ${{ steps.snapshot.outputs.skip }}
     steps:
       - name: Require main branch
         id: snapshot
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -56,17 +59,36 @@ jobs:
           echo "short_sha=${sha:0:7}" >> "${GITHUB_OUTPUT}"
           echo "date=$(date -u +'%Y-%m-%d')" >> "${GITHUB_OUTPUT}"
           echo "ghcr_image=ghcr.io/${repository_owner}/aether" >> "${GITHUB_OUTPUT}"
-          echo "Building main at ${sha}."
+
+          # Scheduled runs are skipped when main has not moved since the last
+          # published nightly; the rolling nightly tag records that commit.
+          # Manual dispatches always run so failures can be retried on demand.
+          skip="false"
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            nightly_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/nightly" --jq '.sha' 2>/dev/null || true)"
+            if [[ -n "${nightly_sha}" && "${nightly_sha}" == "${sha}" ]]; then
+              skip="true"
+            fi
+          fi
+          echo "skip=${skip}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${skip}" == "true" ]]; then
+            echo "No changes on main since the last published nightly; skipping."
+          else
+            echo "Building main at ${sha}."
+          fi
 
   # Keep the scheduled backend coverage in one place so it cannot drift from PR CI.
   rust_ci:
     name: Rust CI
     needs: source
+    if: ${{ needs.source.outputs.skip != 'true' }}
     uses: ./.github/workflows/rust-ci.yml
 
   rust_extended:
     name: Rust extended checks
     needs: source
+    if: ${{ needs.source.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -113,6 +135,7 @@ jobs:
   frontend:
     name: Frontend checks and build
     needs: source
+    if: ${{ needs.source.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -172,6 +195,7 @@ jobs:
   repository_health:
     name: Repository health checks
     needs: source
+    if: ${{ needs.source.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -206,6 +230,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [[ "${{ needs.source.outputs.skip }}" == "true" ]]; then
+            echo 'No changes on main since the last published nightly; skipped.'
+            exit 0
+          fi
+
           failed=0
           echo "source=${{ needs.source.result }}"
           echo "rust_ci=${{ needs.rust_ci.result }}"
@@ -232,7 +261,7 @@ jobs:
   build:
     name: Build ${{ matrix.name }}
     needs: [source, checks]
-    if: ${{ needs.checks.result == 'success' }}
+    if: ${{ needs.checks.result == 'success' && needs.source.outputs.skip != 'true' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
@@ -298,7 +327,7 @@ jobs:
   docker:
     name: Publish nightly GHCR image
     needs: [source, checks, build]
-    if: ${{ needs.checks.result == 'success' && needs.build.result == 'success' }}
+    if: ${{ needs.checks.result == 'success' && needs.build.result == 'success' && needs.source.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     env:
       GHCR_IMAGE: ${{ needs.source.outputs.ghcr_image }}
@@ -365,7 +394,7 @@ jobs:
   package:
     name: Package nightly archives
     needs: [source, checks, build]
-    if: ${{ needs.checks.result == 'success' && needs.build.result == 'success' }}
+    if: ${{ needs.checks.result == 'success' && needs.build.result == 'success' && needs.source.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -442,7 +471,7 @@ jobs:
   github_release:
     name: Publish nightly GitHub Release
     needs: [source, checks, docker, package]
-    if: ${{ needs.checks.result == 'success' && needs.docker.result == 'success' && needs.package.result == 'success' }}
+    if: ${{ needs.checks.result == 'success' && needs.docker.result == 'success' && needs.package.result == 'success' && needs.source.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -593,6 +622,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          if [[ "${{ needs.source.outputs.skip }}" == "true" ]]; then
+            echo 'Nightly skipped: main is unchanged since the last published nightly.'
+            exit 0
+          fi
 
           failed=0
           for entry in \
