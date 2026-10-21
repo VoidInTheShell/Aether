@@ -22,6 +22,7 @@ use axum::{
 use chrono::Utc;
 use serde_json::{json, Value};
 
+use crate::handlers::shared::sample_interval_timeline;
 use crate::GatewayError;
 
 use super::{
@@ -519,6 +520,17 @@ fn infer_client_family_from_user_agent(user_agent: &str) -> Option<&'static str>
     Some("unknown")
 }
 
+fn users_me_usage_chat_pii_redacted(item: &StoredRequestUsageAudit) -> bool {
+    item.request_metadata
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .and_then(|metadata| {
+            metadata.get(aether_data_contracts::repository::usage::CHAT_PII_REDACTION_METADATA_KEY)
+        })
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
 fn users_me_usage_client_family(item: &StoredRequestUsageAudit) -> Option<&str> {
     item.client_family
         .as_deref()
@@ -561,12 +573,15 @@ fn build_users_me_usage_record_payload(
     let cache_read_price_per_1m = item.settlement_cache_read_price_per_1m();
     let cache_creation_input_tokens = users_me_usage_cache_creation_tokens(item);
     let rate_multiplier = item.settlement_rate_multiplier();
+    let billing_multiplier = item.billing_multiplier();
+    let billing_cost = item.billing_cost().map(|cost| round_to(cost, 6));
     let client_is_stream = users_me_usage_client_is_stream(item);
     let upstream_is_stream = users_me_usage_upstream_is_stream(item);
     let mut payload = json!({
         "id": item.id,
         "model": item.model,
         "target_model": serde_json::Value::Null,
+        "response_model": item.provider_response_model(),
         "api_format": item.api_format,
         "endpoint_api_format": item.endpoint_api_format,
         "has_format_conversion": item.has_format_conversion,
@@ -575,6 +590,8 @@ fn build_users_me_usage_record_payload(
         "output_tokens": item.output_tokens,
         "total_tokens": item.total_tokens,
         "cost": round_to(item.total_cost_usd, 6),
+        "billing_multiplier": billing_multiplier,
+        "billing_cost": billing_cost,
         "response_time_ms": item.response_time_ms,
         "first_byte_time_ms": item.first_byte_time_ms,
         "is_stream": item.is_stream,
@@ -594,6 +611,7 @@ fn build_users_me_usage_record_payload(
         "request_path_and_query": users_me_usage_metadata_string(item, "request_path_and_query"),
         "status": item.status,
         "has_fallback": item.has_fallback(),
+        "chat_pii_redaction": users_me_usage_chat_pii_redacted(item),
         "created_at": unix_secs_to_rfc3339(item.created_at_unix_ms),
         "cache_creation_input_tokens": cache_creation_input_tokens,
         "cache_creation_ephemeral_5m_input_tokens": item.cache_creation_ephemeral_5m_input_tokens,
@@ -613,6 +631,8 @@ fn build_users_me_usage_record_payload(
         ),
     });
     payload["end_to_end_time_ms"] = json!(users_me_usage_metadata_u64(item, "end_to_end_time_ms"));
+    payload["routing_group_id"] = json!(item.routing_group_id());
+    payload["routing_group_name"] = json!(item.routing_group_name());
     payload["end_to_end_first_byte_time_ms"] = json!(users_me_usage_metadata_u64(
         item,
         "end_to_end_first_byte_time_ms"
@@ -642,6 +662,8 @@ fn build_users_me_usage_record_payload(
 
 fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_json::Value {
     let cache_creation_input_tokens = users_me_usage_cache_creation_tokens(item);
+    let billing_multiplier = item.billing_multiplier();
+    let billing_cost = item.billing_cost().map(|cost| round_to(cost, 6));
     let client_is_stream = users_me_usage_client_is_stream(item);
     let upstream_is_stream = users_me_usage_upstream_is_stream(item);
     let mut payload = json!({
@@ -658,6 +680,8 @@ fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_
         "cost": round_to(item.total_cost_usd, 6),
         "actual_cost": round_to(item.actual_total_cost_usd, 6),
         "rate_multiplier": item.settlement_rate_multiplier(),
+        "billing_multiplier": billing_multiplier,
+        "billing_cost": billing_cost,
         "response_time_ms": item.response_time_ms,
         "first_byte_time_ms": item.first_byte_time_ms,
         "updated_at": unix_secs_to_rfc3339(item.updated_at_unix_secs),
@@ -681,8 +705,12 @@ fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_
         "client_ip": users_me_usage_metadata_string(item, "client_ip"),
         "user_agent": users_me_usage_metadata_string(item, "user_agent"),
         "target_model": item.target_model,
+        "response_model": item.provider_response_model(),
         "has_fallback": item.has_fallback(),
+        "chat_pii_redaction": users_me_usage_chat_pii_redacted(item),
     });
+    payload["routing_group_id"] = json!(item.routing_group_id());
+    payload["routing_group_name"] = json!(item.routing_group_name());
     payload["end_to_end_time_ms"] = json!(users_me_usage_metadata_u64(item, "end_to_end_time_ms"));
     payload["end_to_end_first_byte_time_ms"] = json!(users_me_usage_metadata_u64(
         item,
@@ -1209,6 +1237,7 @@ pub(super) async fn handle_users_me_usage_get(
                 limit: None,
                 offset: None,
                 newest_first: true,
+                ..Default::default()
             };
             total_record_count = match state
                 .count_usage_audits_by_keyword_search(&keyword_query)
@@ -1259,6 +1288,7 @@ pub(super) async fn handle_users_me_usage_get(
                     limit: None,
                     offset: None,
                     newest_first: true,
+                    ..Default::default()
                 })
                 .await
             {
@@ -1289,6 +1319,7 @@ pub(super) async fn handle_users_me_usage_get(
                     limit: Some(limit),
                     offset: Some(offset),
                     newest_first: true,
+                    ..Default::default()
                 })
                 .await
             {
@@ -1434,6 +1465,7 @@ pub(super) async fn handle_users_me_usage_active_get(
                 limit: Some(50),
                 offset: None,
                 newest_first: true,
+                ..Default::default()
             })
             .await
         {
@@ -1535,21 +1567,23 @@ pub(super) async fn handle_users_me_usage_interval_timeline_get(
         }
     };
 
-    let mut points = Vec::new();
-    for row in intervals {
-        points.push(json!({
-            "x": unix_secs_to_rfc3339(row.created_at_unix_secs),
-            "y": round_to(row.interval_minutes, 2),
-            "model": row.model,
-        }));
-        if points.len() >= limit {
-            break;
-        }
-    }
+    // 按请求顺序抽样并保留首尾点，避免窗口末尾的稀疏请求被截掉。
+    let total_points = intervals.len();
+    let points = sample_interval_timeline(intervals, limit)
+        .into_iter()
+        .map(|row| {
+            json!({
+                "x": unix_secs_to_rfc3339(row.created_at_unix_secs),
+                "y": round_to(row.interval_minutes, 2),
+                "model": row.model,
+            })
+        })
+        .collect::<Vec<_>>();
 
     Json(json!({
         "analysis_period_hours": hours,
-        "total_points": points.len(),
+        "total_points": total_points,
+        "truncated": points.len() < total_points,
         "points": points,
     }))
     .into_response()
@@ -1862,6 +1896,78 @@ mod tests {
     }
 
     #[test]
+    fn user_usage_payloads_preserve_routing_group_snapshot_and_precise_display_cost() {
+        for (metadata, multiplier, cost, group_name) in [
+            (None, 1.0, json!(0.0), serde_json::Value::Null),
+            (
+                Some(json!({"routing_group_billing_multiplier": 0.0})),
+                0.0,
+                json!(0.0),
+                serde_json::Value::Null,
+            ),
+            (
+                Some(json!({
+                    "routing_group_billing_multiplier": 2.5,
+                    "routing_group_id": "group-1",
+                    "routing_group_name": "请求时的分组",
+                    "rate_multiplier": 0.5
+                })),
+                2.5,
+                json!(0.000004),
+                json!("请求时的分组"),
+            ),
+            (
+                Some(json!({
+                    "billing_multiplier_snapshot": {"version": 1, "factors": {"routing_group": 2.5, "user_group": 2.0}, "multiplier": 5.0},
+                    "routing_group_billing_multiplier": 2.5,
+                    "routing_group_id": "group-1",
+                    "routing_group_name": "请求时的分组",
+                    "rate_multiplier": 0.5
+                })),
+                5.0,
+                json!(0.000007),
+                json!("请求时的分组"),
+            ),
+        ] {
+            let item = StoredRequestUsageAudit {
+                total_cost_usd: 0.00000149,
+                actual_total_cost_usd: 0.0000002,
+                request_metadata: metadata,
+                ..sample_usage("completed")
+            };
+            let record = build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+            let active = build_users_me_usage_active_payload(&item);
+            for payload in [&record, &active] {
+                assert_eq!(payload["billing_multiplier"], multiplier);
+                assert_eq!(payload["billing_cost"], cost);
+                assert_eq!(payload["routing_group_name"], group_name);
+                assert_eq!(payload["cost"], 0.000001);
+            }
+            assert!(record.get("actual_cost").is_none());
+            assert!(record.get("rate_multiplier").is_none());
+        }
+    }
+
+    #[test]
+    fn user_usage_payloads_expose_response_model_separately_from_mapping() {
+        let item = StoredRequestUsageAudit {
+            target_model: Some("provider-mapped-model".to_string()),
+            request_metadata: Some(json!({
+                "provider_response_model": "gpt-5.1"
+            })),
+            ..sample_usage("completed")
+        };
+
+        let record = build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+        let active = build_users_me_usage_active_payload(&item);
+
+        for payload in [&record, &active] {
+            assert_eq!(payload["target_model"], "provider-mapped-model");
+            assert_eq!(payload["response_model"], "gpt-5.1");
+        }
+    }
+
+    #[test]
     fn user_usage_payloads_project_end_to_end_timings_from_metadata() {
         let item = StoredRequestUsageAudit {
             response_time_ms: Some(626),
@@ -1903,6 +2009,29 @@ mod tests {
         assert_eq!(active["requested_reasoning_effort"], "xhigh");
         assert_eq!(record["reasoning_effort"], "max");
         assert_eq!(active["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn user_usage_payloads_expose_gemini_thinking_config_reasoning_mapping() {
+        let item = StoredRequestUsageAudit {
+            request_body: Some(json!({
+                "generationConfig": {
+                    "thinkingConfig": { "includeThoughts": true, "thinkingLevel": "HIGH" }
+                }
+            })),
+            provider_request_body: Some(json!({
+                "generationConfig": { "thinkingConfig": { "thinkingBudget": 8192 } }
+            })),
+            ..sample_usage("completed")
+        };
+
+        let record = build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+        let active = build_users_me_usage_active_payload(&item);
+
+        assert_eq!(record["requested_reasoning_effort"], "high");
+        assert_eq!(active["requested_reasoning_effort"], "high");
+        assert_eq!(record["reasoning_effort"], "xhigh");
+        assert_eq!(active["reasoning_effort"], "xhigh");
     }
 
     #[test]
@@ -2251,6 +2380,7 @@ mod tests {
             client_response_body_ref: Some(
                 "usage://request/req-1/client_response_body".to_string(),
             ),
+            request_metadata: Some(json!({"chat_pii_redaction": true})),
             ..sample_usage("completed")
         };
 
@@ -2269,5 +2399,7 @@ mod tests {
         assert_eq!(active_payload["upstream_is_stream"], true);
         assert_eq!(active_payload["client_requested_stream"], false);
         assert_eq!(active_payload["client_is_stream"], false);
+        assert_eq!(record_payload["chat_pii_redaction"], true);
+        assert_eq!(active_payload["chat_pii_redaction"], true);
     }
 }

@@ -1,5 +1,5 @@
 use super::super::resolve_usage_user_group_scope;
-use super::super::stats::resolve_admin_usage_time_range;
+use super::super::stats::resolve_usage_time_bounds;
 use super::analytics::admin_usage_api_key_names;
 use super::analytics::admin_usage_provider_key_names;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
@@ -33,6 +33,12 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
 const ADMIN_USAGE_ACTIVE_LIMIT: usize = 50;
+
+pub(super) fn resolve_record_time_bounds(
+    query: Option<&str>,
+) -> Result<Option<(u64, u64)>, String> {
+    resolve_usage_time_bounds(query)
+}
 
 async fn load_admin_usage_by_ids(
     state: &AdminAppState<'_>,
@@ -71,27 +77,37 @@ fn apply_admin_usage_status_filter(query: &mut UsageAuditListQuery, status: Opti
         }
         "websocket" | "ws" => query.is_websocket = Some(true),
         "error" | "failed" => query.error_only = true,
+        "success" => query.statuses = Some(vec!["completed".to_string()]),
         "active" => {
             query.statuses = Some(vec!["pending".to_string(), "streaming".to_string()]);
         }
         "pending" | "streaming" | "completed" | "cancelled" => {
             query.statuses = Some(vec![status]);
         }
-        "has_fallback" | "has_retry" => {}
+        "has_fallback" | "has_retry" | "has_skipped_candidate" => {}
         _ => {}
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct AdminUsageAttemptFlags {
     has_fallback: bool,
     has_retry: bool,
+    /// 是否存在"被调度跳过"的候选（调度阶段判定本次不可用，从未向上游发起请求）。
+    ///
+    /// 这是与 has_fallback 正交的信号：has_fallback 表示"更靠前的候选真的失败并被换掉"，
+    /// 而本字段表示"更靠前的候选压根没被发出去"。两者在日志列表里观感都是"换了提供商"，
+    /// 但用户拿不到 has_fallback 小图标时容易误判为调度错误，故单独暴露。
+    has_skipped_candidate: bool,
+    /// 跳过原因（去重、保持出现顺序），用于前端 tooltip 直接说明"为什么没用它"。
+    skipped_candidate_reasons: Vec<String>,
 }
 
 fn admin_usage_attempt_status_filter(status: Option<&str>) -> Option<&'static str> {
     match status?.trim().to_ascii_lowercase().as_str() {
         "has_fallback" => Some("has_fallback"),
         "has_retry" => Some("has_retry"),
+        "has_skipped_candidate" => Some("has_skipped_candidate"),
         _ => None,
     }
 }
@@ -146,11 +162,36 @@ fn admin_usage_attempt_flags_from_candidates(
         })
     });
     let has_retry = candidates.iter().any(admin_usage_candidate_was_retried);
+    let skipped_candidate_reasons = admin_usage_skipped_candidate_reasons(candidates);
 
     AdminUsageAttemptFlags {
         has_fallback,
         has_retry,
+        has_skipped_candidate: !skipped_candidate_reasons.is_empty(),
+        skipped_candidate_reasons,
     }
+}
+
+/// 收集被跳过候选的原因，去重并保持候选顺序（决定性的在前，便于阅读）。
+fn admin_usage_skipped_candidate_reasons(candidates: &[StoredRequestCandidate]) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate.status == RequestCandidateStatus::Skipped)
+    {
+        let Some(reason) = candidate
+            .skip_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+        else {
+            continue;
+        };
+        if !reasons.iter().any(|existing| existing == reason) {
+            reasons.push(reason.to_string());
+        }
+    }
+    reasons
 }
 
 fn admin_usage_attempt_flags_for_item(
@@ -158,13 +199,15 @@ fn admin_usage_attempt_flags_for_item(
     flags_by_usage_id: &BTreeMap<String, AdminUsageAttemptFlags>,
     request_candidate_reader_available: bool,
 ) -> AdminUsageAttemptFlags {
-    flags_by_usage_id.get(&item.id).copied().unwrap_or_else(|| {
+    flags_by_usage_id.get(&item.id).cloned().unwrap_or_else(|| {
         if request_candidate_reader_available {
             AdminUsageAttemptFlags::default()
         } else {
             AdminUsageAttemptFlags {
                 has_fallback: admin_usage_has_fallback(item),
                 has_retry: false,
+                has_skipped_candidate: false,
+                skipped_candidate_reasons: Vec::new(),
             }
         }
     })
@@ -433,6 +476,8 @@ fn admin_usage_matches_attempt_status(
     match status {
         "has_fallback" => flags.has_fallback,
         "has_retry" => flags.has_retry,
+        // 与 has_fallback 区分：这里是"更靠前的候选被调度跳过、根本没发出去"
+        "has_skipped_candidate" => flags.has_skipped_candidate,
         _ => true,
     }
 }
@@ -504,6 +549,9 @@ fn build_admin_usage_records_response_with_attempt_flags(
             );
             record["has_fallback"] = json!(flags.has_fallback);
             record["has_retry"] = json!(flags.has_retry);
+            // 被跳过的候选：前端据此提示"这次没用某个提供商，是因为它在调度阶段就被排除了"。
+            record["has_skipped_candidate"] = json!(flags.has_skipped_candidate);
+            record["skipped_candidate_reasons"] = json!(flags.skipped_candidate_reasons);
             record
         })
         .collect();
@@ -524,12 +572,37 @@ fn build_admin_usage_records_query(
     query: Option<&str>,
     limit: Option<usize>,
     offset: Option<usize>,
-) -> UsageAuditListQuery {
+) -> Result<UsageAuditListQuery, String> {
+    let boolean = |key| match query_param_value(query, key).as_deref() {
+        None => Ok(None),
+        Some("true" | "1") => Ok(Some(true)),
+        Some("false" | "0") => Ok(Some(false)),
+        Some(_) => Err(format!("invalid {key}: expected true or false")),
+    };
+    let slow_threshold_ms = query_param_value(query, "slow_threshold_ms")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|value| (1..=86_400_000).contains(value))
+                .ok_or_else(|| "slow_threshold_ms must be between 1 and 86400000".to_string())
+        })
+        .transpose()?;
     let mut list_query = UsageAuditListQuery {
         created_from_unix_secs: Some(created_from_unix_secs),
         created_until_unix_secs: Some(created_until_unix_secs),
         user_id: query_param_value(query, "user_id"),
         provider_name: query_param_value(query, "provider"),
+        provider_id: query_param_value(query, "provider_id"),
+        api_key_id: query_param_value(query, "api_key_id"),
+        request_id: query_param_value(query, "request_id"),
+        attribution_kind: query_param_value(query, "attribution_kind"),
+        actor_user_id: query_param_value(query, "actor_user_id"),
+        slow_threshold_ms,
+        endpoint_kind: query_param_value(query, "endpoint_kind"),
+        request_type: query_param_value(query, "request_type"),
+        has_format_conversion: boolean("has_format_conversion")?,
+        is_stream: boolean("is_stream")?,
         model: query_param_value(query, "model"),
         api_format: query_param_value(query, "api_format"),
         limit,
@@ -537,11 +610,23 @@ fn build_admin_usage_records_query(
         newest_first: true,
         ..Default::default()
     };
+    if list_query
+        .attribution_kind
+        .as_deref()
+        .is_some_and(|kind| !matches!(kind, "employee" | "standalone" | "unknown"))
+    {
+        return Err("invalid attribution_kind".into());
+    }
+    if list_query.attribution_kind.as_deref() == Some("employee")
+        && list_query.actor_user_id.is_none()
+    {
+        list_query.actor_user_id = list_query.user_id.take();
+    }
     apply_admin_usage_status_filter(
         &mut list_query,
         query_param_value(query, "status").as_deref(),
     );
-    list_query
+    Ok(list_query)
 }
 
 fn parse_admin_usage_search_keywords(search: &str) -> Vec<String> {
@@ -654,6 +739,15 @@ fn build_admin_usage_keyword_search_query(
         created_until_unix_secs: base_query.created_until_unix_secs,
         user_id: base_query.user_id.clone(),
         provider_name: base_query.provider_name.clone(),
+        provider_id: base_query.provider_id.clone(),
+        api_key_id: base_query.api_key_id.clone(),
+        request_id: base_query.request_id.clone(),
+        attribution_kind: base_query.attribution_kind.clone(),
+        actor_user_id: base_query.actor_user_id.clone(),
+        slow_threshold_ms: base_query.slow_threshold_ms,
+        endpoint_kind: base_query.endpoint_kind.clone(),
+        request_type: base_query.request_type.clone(),
+        has_format_conversion: base_query.has_format_conversion,
         model: base_query.model.clone(),
         api_format: base_query.api_format.clone(),
         client_family: base_query.client_family.clone(),
@@ -700,13 +794,11 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
             }
 
             let query = request_context.request_query_string.as_deref();
-            let time_range = match resolve_admin_usage_time_range(query) {
+            let time_bounds = match resolve_record_time_bounds(query) {
                 Ok(value) => value,
                 Err(detail) => return Ok(Some(admin_usage_bad_request_response(detail))),
             };
-            let Some((created_from_unix_secs, created_until_unix_secs)) =
-                time_range.to_unix_bounds()
-            else {
+            let Some((created_from_unix_secs, created_until_unix_secs)) = time_bounds else {
                 return Ok(Some(build_admin_usage_summary_stats_response_from_summary(
                     &Default::default(),
                 )));
@@ -717,6 +809,8 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
             };
             let summary = state
                 .summarize_usage_audits(&UsageAuditSummaryQuery {
+                    provider_names: super::super::resolve_usage_group_provider_names(state, query)
+                        .await?,
                     created_from_unix_secs,
                     created_until_unix_secs,
                     user_id: query_param_value(query, "user_id"),
@@ -749,13 +843,11 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
                 sort_usage_newest_first(&mut items);
                 items
             } else {
-                let time_range = match resolve_admin_usage_time_range(query) {
+                let time_bounds = match resolve_record_time_bounds(query) {
                     Ok(value) => value,
                     Err(detail) => return Ok(Some(admin_usage_bad_request_response(detail))),
                 };
-                let Some((created_from_unix_secs, created_until_unix_secs)) =
-                    time_range.to_unix_bounds()
-                else {
+                let Some((created_from_unix_secs, created_until_unix_secs)) = time_bounds else {
                     return Ok(Some(build_admin_usage_active_requests_response(
                         &[],
                         &BTreeMap::new(),
@@ -812,7 +904,7 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
             }
 
             let query = request_context.request_query_string.as_deref();
-            let time_range = match resolve_admin_usage_time_range(query) {
+            let time_bounds = match resolve_record_time_bounds(query) {
                 Ok(value) => value,
                 Err(detail) => return Ok(Some(admin_usage_bad_request_response(detail))),
             };
@@ -833,9 +925,7 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
                 Ok(value) => value,
                 Err(detail) => return Ok(Some(admin_usage_bad_request_response(detail))),
             };
-            let Some((created_from_unix_secs, created_until_unix_secs)) =
-                time_range.to_unix_bounds()
-            else {
+            let Some((created_from_unix_secs, created_until_unix_secs)) = time_bounds else {
                 return Ok(Some(build_admin_usage_records_response(
                     &[],
                     &BTreeMap::new(),
@@ -855,13 +945,16 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
             let active_client_family_filter = client_family_filter
                 .as_deref()
                 .filter(|value| !value.trim().is_empty());
-            let mut base_query = build_admin_usage_records_query(
+            let mut base_query = match build_admin_usage_records_query(
                 created_from_unix_secs,
                 created_until_unix_secs,
                 query,
                 None,
                 None,
-            );
+            ) {
+                Ok(value) => value,
+                Err(detail) => return Ok(Some(admin_usage_bad_request_response(detail))),
+            };
             base_query.client_family = active_client_family_filter.map(str::to_owned);
             base_query.exclude_unknown_model_or_provider = hide_unknown_records;
             let (usage, total, total_is_estimated) = if attempt_status_filter.is_some() {
@@ -1034,12 +1127,97 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn precise_record_ranges_preserve_minutes_and_reject_mixed_presets() {
+        let range = "from=2026-09-01T23:45:00Z&to=2026-09-02T00:15:00Z&timezone=Asia%2FShanghai";
+        let (from, to) = super::resolve_record_time_bounds(Some(range))
+            .unwrap()
+            .unwrap();
+        assert_eq!(to - from, 30 * 60);
+        assert!(super::resolve_record_time_bounds(Some(&format!("{range}&preset=today"))).is_err());
+        assert!(super::resolve_record_time_bounds(Some("from=2026-09-01T00:00:00Z")).is_err());
+    }
+
+    #[test]
+    fn overview_record_drilldown_preserves_actor_and_performance_filters() {
+        let raw = "user_id=employee-1&attribution_kind=employee&provider_id=provider-1&api_key_id=key-1&request_id=request-1&endpoint_kind=chat&request_type=chat&is_stream=true&has_format_conversion=false&slow_threshold_ms=12000&status=success";
+        let query =
+            super::build_admin_usage_records_query(100, 200, Some(raw), None, None).unwrap();
+        assert_eq!(query.user_id, None);
+        assert_eq!(query.actor_user_id.as_deref(), Some("employee-1"));
+        assert_eq!(query.provider_id.as_deref(), Some("provider-1"));
+        assert_eq!(query.api_key_id.as_deref(), Some("key-1"));
+        assert_eq!(query.request_id.as_deref(), Some("request-1"));
+        assert_eq!(query.slow_threshold_ms, Some(12_000));
+        assert_eq!(query.is_stream, Some(true));
+        assert_eq!(query.has_format_conversion, Some(false));
+        assert_eq!(query.statuses, Some(vec!["completed".into()]));
+        let keyword = super::build_admin_usage_keyword_search_query(
+            &query,
+            vec!["example".into()],
+            None,
+            Default::default(),
+            false,
+            false,
+            None,
+            None,
+        );
+        assert_eq!(keyword.actor_user_id, query.actor_user_id);
+        assert_eq!(keyword.slow_threshold_ms, query.slow_threshold_ms);
+        assert_eq!(keyword.has_format_conversion, query.has_format_conversion);
+        for invalid in [
+            "is_stream=maybe",
+            "slow_threshold_ms=0",
+            "attribution_kind=owner",
+        ] {
+            assert!(
+                super::build_admin_usage_records_query(100, 200, Some(invalid), None, None)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn overview_record_drilldown_preserves_standalone_key_ownership() {
+        let raw = "user_id=owner-1&attribution_kind=standalone&api_key_id=standalone-key";
+        let query =
+            super::build_admin_usage_records_query(100, 200, Some(raw), None, None).unwrap();
+        assert_eq!(query.attribution_kind.as_deref(), Some("standalone"));
+        assert_eq!(query.user_id.as_deref(), Some("owner-1"));
+        assert_eq!(query.actor_user_id, None);
+        assert_eq!(query.api_key_id.as_deref(), Some("standalone-key"));
+        let keyword = super::build_admin_usage_keyword_search_query(
+            &query,
+            vec!["example".into()],
+            None,
+            Default::default(),
+            false,
+            false,
+            None,
+            None,
+        );
+        assert_eq!(keyword.attribution_kind, query.attribution_kind);
+        assert_eq!(keyword.user_id, query.user_id);
+        assert_eq!(keyword.actor_user_id, query.actor_user_id);
+        assert_eq!(keyword.api_key_id, query.api_key_id);
+
+        for retired_kind in ["service", "shared"] {
+            let raw = format!("attribution_kind={retired_kind}");
+            assert!(
+                super::build_admin_usage_records_query(100, 200, Some(&raw), None, None).is_err(),
+                "{retired_kind}"
+            );
+        }
+    }
+
     use aether_data_contracts::repository::candidates::{
         RequestCandidateStatus, StoredRequestCandidate,
     };
+    use aether_data_contracts::repository::usage::StoredRequestUsageAudit;
     use serde_json::json;
 
     use super::{
+        admin_usage_attempt_flags_from_candidates, admin_usage_skipped_candidate_reasons,
         admin_usage_terminal_candidate_state_override, build_admin_usage_keyword_search_query,
         build_admin_usage_records_query, latest_admin_usage_image_progress,
         AdminUsageSearchContext,
@@ -1079,6 +1257,144 @@ mod tests {
             Some(10_210),
         )
         .expect("candidate should build")
+    }
+
+    /// 构造一条"被调度跳过"的候选（从未向上游发起请求）。
+    fn skipped_candidate(candidate_index: i32, reason: &str) -> StoredRequestCandidate {
+        let mut candidate = sample_candidate(
+            candidate_index,
+            RequestCandidateStatus::Skipped,
+            None,
+            None,
+            None,
+        );
+        candidate.skip_reason = Some(reason.to_string());
+        // 跳过候选没有开始时间，is_attempted 因此为 false
+        candidate.started_at_unix_ms = None;
+        candidate
+    }
+
+    #[test]
+    fn skipped_candidate_reasons_are_deduplicated_in_candidate_order() {
+        let reasons = admin_usage_skipped_candidate_reasons(&[
+            skipped_candidate(0, "key_rpm_exhausted"),
+            skipped_candidate(1, "provider_inactive"),
+            skipped_candidate(2, "key_rpm_exhausted"),
+        ]);
+
+        assert_eq!(
+            reasons,
+            vec![
+                "key_rpm_exhausted".to_string(),
+                "provider_inactive".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn skipped_candidate_reasons_ignore_attempted_candidates() {
+        // 真正发起过请求的失败候选不属于"被跳过"，避免与 has_fallback 语义混淆
+        let failed = sample_candidate(
+            0,
+            RequestCandidateStatus::Failed,
+            Some(503),
+            Some(1_000),
+            Some("upstream exploded"),
+        );
+        assert!(admin_usage_skipped_candidate_reasons(&[failed]).is_empty());
+    }
+
+    #[test]
+    fn attempt_flags_report_skipped_candidates_without_fallback() {
+        let candidates = vec![
+            skipped_candidate(0, "key_rpm_exhausted"),
+            sample_candidate(
+                1,
+                RequestCandidateStatus::Success,
+                Some(200),
+                Some(900),
+                None,
+            ),
+        ];
+
+        let flags = admin_usage_attempt_flags_from_candidates(&sample_usage_audit(), &candidates);
+
+        // 这正是用户遇到的场景：换了提供商，但没有任何候选失败过
+        assert!(flags.has_skipped_candidate);
+        assert!(!flags.has_fallback);
+        assert_eq!(
+            flags.skipped_candidate_reasons,
+            vec!["key_rpm_exhausted".to_string()]
+        );
+    }
+
+    #[test]
+    fn attempt_flags_keep_fallback_and_skipped_candidate_independent() {
+        let candidates = vec![
+            skipped_candidate(0, "provider_inactive"),
+            sample_candidate(
+                1,
+                RequestCandidateStatus::Failed,
+                Some(503),
+                Some(500),
+                None,
+            ),
+            sample_candidate(
+                2,
+                RequestCandidateStatus::Success,
+                Some(200),
+                Some(700),
+                None,
+            ),
+        ];
+
+        let flags = admin_usage_attempt_flags_from_candidates(&sample_usage_audit(), &candidates);
+
+        assert!(flags.has_skipped_candidate);
+        assert!(flags.has_fallback);
+    }
+
+    /// 最小可用的用量审计行，仅用于驱动 flags 计算（其中候选 id 为空即可）。
+    fn sample_usage_audit() -> StoredRequestUsageAudit {
+        StoredRequestUsageAudit::new(
+            "usage-1".to_string(),
+            "req-1".to_string(),
+            Some("user-1".to_string()),
+            Some("api-key-1".to_string()),
+            Some("alice".to_string()),
+            Some("default".to_string()),
+            "OpenAI".to_string(),
+            "gpt-4.1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("openai:chat".to_string()),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            Some("openai:chat".to_string()),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            false,
+            false,
+            10,
+            20,
+            30,
+            0.0,
+            0.0,
+            Some(200),
+            None,
+            None,
+            None,
+            None,
+            "completed".to_string(),
+            "settled".to_string(),
+            1_000,
+            1_001,
+            None,
+        )
+        .expect("usage should build")
     }
 
     #[test]
@@ -1175,7 +1491,7 @@ mod tests {
         for status in ["websocket", "ws", "WS"] {
             let raw_query = format!("status={status}");
             let list_query =
-                build_admin_usage_records_query(100, 200, Some(&raw_query), None, None);
+                build_admin_usage_records_query(100, 200, Some(&raw_query), None, None).unwrap();
 
             assert_eq!(list_query.is_websocket, Some(true));
             assert_eq!(list_query.is_stream, None);
@@ -1196,7 +1512,7 @@ mod tests {
         for (status, expected_stream) in [("stream", true), ("standard", false)] {
             let raw_query = format!("status={status}");
             let list_query =
-                build_admin_usage_records_query(100, 200, Some(&raw_query), None, None);
+                build_admin_usage_records_query(100, 200, Some(&raw_query), None, None).unwrap();
             assert_eq!(list_query.is_stream, Some(expected_stream));
             assert_eq!(list_query.is_websocket, Some(false));
 

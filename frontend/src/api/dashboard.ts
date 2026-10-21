@@ -217,8 +217,11 @@ export interface RequestDetail {
   api_format?: string
   endpoint_api_format?: string
   has_format_conversion?: boolean | null
+  /** 请求体实际发生过敏感信息脱敏（上游收到的是占位符）。 */
+  chat_pii_redaction?: boolean
   model: string
   target_model?: string | null  // 映射后的目标模型名
+  response_model?: string | null  // 上游响应体实际返回的模型名
   requested_reasoning_effort?: string | null
   reasoning_effort?: string | null
   service_tier?: string | null
@@ -249,6 +252,10 @@ export interface RequestDetail {
   output_cost?: number
   total_cost?: number
   actual_cost?: number
+  billing_multiplier?: number | null
+  routing_group_id?: string | null
+  routing_group_name?: string | null
+  billing_cost?: number | null
   cache_creation_cost?: number
   cache_read_cost?: number
   image_output_cost?: number

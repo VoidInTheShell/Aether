@@ -262,6 +262,27 @@ fn classifies_wallet_redeem_as_public_support_route() {
 }
 
 #[test]
+fn classifies_personal_announcements_as_authenticated_user_route() {
+    let headers = headers(&[]);
+    for path in [
+        "/api/announcements/users/me?limit=20&offset=0&unread_only=false",
+        "/api/announcements/users/me/",
+    ] {
+        let uri: Uri = path.parse().expect("uri should parse");
+        let decision = classify_control_route(&http::Method::GET, &uri, &headers)
+            .expect("route should classify");
+        assert_eq!(decision.route_class.as_deref(), Some("public_support"));
+        assert_eq!(decision.route_family.as_deref(), Some("announcement_user"));
+        assert_eq!(decision.route_kind.as_deref(), Some("list"));
+        assert_eq!(
+            decision.auth_endpoint_signature.as_deref(),
+            Some("user:announcements")
+        );
+        assert!(!decision.is_execution_runtime_candidate());
+    }
+}
+
+#[test]
 fn classifies_announcement_unread_count_as_public_support_route() {
     let headers = headers(&[]);
     let uri: Uri = "/api/announcements/users/me/unread-count"
@@ -439,6 +460,11 @@ fn classifies_users_me_routes_as_public_support_route() {
             http::Method::GET,
             "/api/users/me/available-models",
             "available_models",
+        ),
+        (
+            http::Method::GET,
+            "/api/users/me/routing-groups",
+            "routing_groups",
         ),
         (
             http::Method::GET,
@@ -1096,6 +1122,25 @@ fn classifies_capabilities_model_as_public_support_route() {
     assert_eq!(
         decision.auth_endpoint_signature.as_deref(),
         Some("public:capabilities")
+    );
+    assert!(!decision.is_execution_runtime_candidate());
+}
+
+#[test]
+fn classifies_modules_user_status_as_public_support_route() {
+    let headers = headers(&[]);
+    let uri: Uri = "/api/modules/user-status"
+        .parse()
+        .expect("uri should parse");
+    let decision =
+        classify_control_route(&http::Method::GET, &uri, &headers).expect("route should classify");
+
+    assert_eq!(decision.route_class.as_deref(), Some("public_support"));
+    assert_eq!(decision.route_family.as_deref(), Some("modules"));
+    assert_eq!(decision.route_kind.as_deref(), Some("user_status"));
+    assert_eq!(
+        decision.auth_endpoint_signature.as_deref(),
+        Some("public:modules")
     );
     assert!(!decision.is_execution_runtime_candidate());
 }

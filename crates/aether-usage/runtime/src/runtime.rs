@@ -21,13 +21,12 @@ use crate::executor::spawn_on_usage_background_runtime;
 use crate::queue::is_permanent_enqueue_error;
 use crate::request_metadata::{
     attach_client_request_body_metadata, attach_provider_request_body_metadata,
-    attach_provider_response_body_metadata, clear_client_request_body_metadata,
-    clear_provider_request_body_metadata, request_body_derived_facts_action,
-    retain_first_byte_request_metadata, RequestBodyDerivedFactsAction,
+    attach_provider_response_body_metadata, attach_provider_response_model_metadata,
+    clear_client_request_body_metadata, clear_provider_request_body_metadata,
+    request_body_derived_facts_action, retain_first_byte_request_metadata,
+    RequestBodyDerivedFactsAction,
 };
-use crate::settlement::{
-    reconcile_usage_policy_cost_for_event_with_result, settle_usage_with_reconciled_cost,
-};
+use crate::settlement::settle_usage_after_upsert;
 use crate::shutdown::{UsageBackgroundTasks, UsageShutdownState};
 use crate::worker::{
     build_usage_queue_worker_with_record_gate, UsageWorkerControl, UsageWorkerObservation,
@@ -58,12 +57,16 @@ pub const DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES: usize = usize::MAX;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsageBodyCapturePolicy {
     pub record_level: UsageRequestRecordLevel,
+    pub compact_base64_images: bool,
+    pub max_body_bytes: Option<usize>,
 }
 
 impl Default for UsageBodyCapturePolicy {
     fn default() -> Self {
         Self {
             record_level: UsageRequestRecordLevel::Basic,
+            compact_base64_images: false,
+            max_body_bytes: None,
         }
     }
 }
@@ -5155,21 +5158,6 @@ impl UsageRuntime {
     where
         T: UsageRuntimeAccess,
     {
-        let reconciled = match reconcile_usage_policy_cost_for_event_with_result(data, event).await
-        {
-            Ok(reconciled) => reconciled,
-            Err(err) => {
-                warn!(
-                    event_name = "usage_event_cost_reconciliation_failed",
-                    log_type = "event",
-                    usage_event_type = ?event.event_type,
-                    request_id = %event.request_id,
-                    error = %err,
-                    "usage runtime failed to reconcile plan cost before direct usage upsert"
-                );
-                return false;
-            }
-        };
         match build_upsert_usage_record_from_event(event) {
             Ok(record) => match catch_usage_writer_panic(
                 "direct usage upsert",
@@ -5178,9 +5166,7 @@ impl UsageRuntime {
             .await
             {
                 Ok(Some(stored)) => {
-                    if let Err(err) =
-                        settle_usage_with_reconciled_cost(data, &stored, reconciled).await
-                    {
+                    if let Err(err) = settle_usage_after_upsert(data, &stored, event).await {
                         warn!(
                             event_name = "usage_terminal_settlement_failed",
                             log_type = "event",
@@ -5297,8 +5283,17 @@ fn preserve_request_facts_with_legacy_missing(
 
 fn preserve_provider_response_facts(event: &mut UsageEvent) {
     let metadata = event.data.request_metadata.take();
-    event.data.request_metadata =
+    let metadata =
         attach_provider_response_body_metadata(metadata, event.data.response_body.as_ref());
+    event.data.request_metadata = attach_provider_response_model_metadata(
+        metadata,
+        event.data.request_body.as_ref(),
+        event.data.request_body_state,
+        event.data.api_format.as_deref(),
+        event.data.response_body.as_ref(),
+        event.data.response_body_state,
+        event.data.endpoint_api_format.as_deref(),
+    );
 }
 
 impl UsageQueueHealthSnapshot {
@@ -10045,6 +10040,24 @@ mod tests {
             2,
             "the later direct caller should receive its own bounded write attempt"
         );
+        // Direct persistence can finish before the submission worker joins the
+        // barrier handoff and accounts for its completed slot.
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = runtime.metrics_snapshot();
+                let submission = &runtime.lifecycle_submission.state;
+                if snapshot.terminal_submission_pending == 0
+                    && snapshot.ordered_lifecycle_pending == 0
+                    && snapshot.lifecycle_submission_pending == 0
+                    && submission.admission.available_permits() == submission.capacity
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("failed terminal submission accounting and admission should drain");
         let snapshot = runtime.metrics_snapshot();
         assert_eq!(snapshot.terminal_submission_pending, 0);
         assert_eq!(snapshot.ordered_lifecycle_pending, 0);
@@ -10152,24 +10165,43 @@ mod tests {
             .await;
 
         assert_eq!(remaining_policy_panics.load(Ordering::Acquire), 0);
-        let records = records.lock().expect("records lock");
-        assert_eq!(
-            records
-                .iter()
-                .filter(|record| record.request_id == healthy_request_id)
-                .count(),
-            2,
-            "the same terminal shard should continue processing healthy requests"
-        );
-        assert!(
-            records
-                .iter()
-                .filter(|record| record.request_id == failed_request_id)
-                .count()
-                == 1,
-            "only the later healthy attempt should persist for the panicked request"
-        );
-        drop(records);
+        {
+            let records = records.lock().expect("records lock");
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| record.request_id == healthy_request_id)
+                    .count(),
+                2,
+                "the same terminal shard should continue processing healthy requests"
+            );
+            assert!(
+                records
+                    .iter()
+                    .filter(|record| record.request_id == failed_request_id)
+                    .count()
+                    == 1,
+                "only the later healthy attempt should persist for the panicked request"
+            );
+        }
+        // The final direct attempt also submits a barrier whose worker may
+        // account for completion after the persistence call has returned.
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = runtime.metrics_snapshot();
+                let submission = &runtime.lifecycle_submission.state;
+                if snapshot.terminal_submission_pending == 0
+                    && snapshot.ordered_lifecycle_pending == 0
+                    && snapshot.lifecycle_submission_pending == 0
+                    && submission.admission.available_permits() == submission.capacity
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("panicked terminal submission accounting and admission should drain");
         let snapshot = runtime.metrics_snapshot();
         assert_eq!(snapshot.terminal_submission_pending, 0);
         assert_eq!(snapshot.ordered_lifecycle_pending, 0);
@@ -12758,6 +12790,7 @@ mod tests {
         apply_usage_body_capture_policy_to_event(
             UsageBodyCapturePolicy {
                 record_level: UsageRequestRecordLevel::Full,
+                ..UsageBodyCapturePolicy::default()
             },
             &mut event,
         );
@@ -14425,6 +14458,7 @@ mod tests {
         apply_usage_body_capture_policy_to_event(
             UsageBodyCapturePolicy {
                 record_level: UsageRequestRecordLevel::Full,
+                ..UsageBodyCapturePolicy::default()
             },
             &mut event,
         );
@@ -14503,6 +14537,7 @@ mod tests {
         apply_usage_body_capture_policy_to_event(
             UsageBodyCapturePolicy {
                 record_level: UsageRequestRecordLevel::Basic,
+                ..UsageBodyCapturePolicy::default()
             },
             &mut event,
         );

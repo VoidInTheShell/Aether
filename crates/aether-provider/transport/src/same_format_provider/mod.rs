@@ -81,6 +81,7 @@ pub struct SameFormatProviderRequestBodyInput<'a> {
     pub force_body_stream_field: bool,
     pub kiro_auth_config: Option<&'a KiroAuthConfig>,
     pub is_claude_code: bool,
+    pub is_vertex: bool,
     pub enable_model_directives: bool,
 }
 
@@ -110,6 +111,7 @@ impl fmt::Debug for SameFormatProviderRequestBodyInput<'_> {
             .field("force_body_stream_field", &self.force_body_stream_field)
             .field("has_kiro_auth_config", &self.kiro_auth_config.is_some())
             .field("is_claude_code", &self.is_claude_code)
+            .field("is_vertex", &self.is_vertex)
             .field("enable_model_directives", &self.enable_model_directives)
             .finish()
     }
@@ -273,7 +275,10 @@ pub fn classify_same_format_provider_request_behavior_for_operation(
         );
     let operation_requires_sync = matches!(
         api_operation,
-        Some(aether_ai_formats::ApiOperation::ClaudeCountTokens)
+        Some(
+            aether_ai_formats::ApiOperation::ClaudeCountTokens
+                | aether_ai_formats::ApiOperation::OpenAiMemoriesSummarize
+        )
     );
     let upstream_is_stream = !operation_requires_sync
         && aether_ai_formats::resolve_upstream_is_stream_for_provider(
@@ -321,6 +326,7 @@ pub fn build_same_format_provider_request_body(
         input,
         None,
         aether_ai_formats::OpenAiResponsesReasoningReplayPolicy::OpenAiItemIds,
+        false,
     )
 }
 
@@ -337,11 +343,34 @@ pub fn build_same_format_provider_request_body_with_compatibility_report_and_rea
     input: SameFormatProviderRequestBodyInput<'_>,
     reasoning_replay_policy: aether_ai_formats::OpenAiResponsesReasoningReplayPolicy,
 ) -> Option<SameFormatProviderRequestBodyOutput> {
+    build_same_format_provider_request_body_for_operation(input, reasoning_replay_policy, None)
+}
+
+pub fn build_same_format_provider_request_body_for_operation(
+    input: SameFormatProviderRequestBodyInput<'_>,
+    reasoning_replay_policy: aether_ai_formats::OpenAiResponsesReasoningReplayPolicy,
+    api_operation: Option<aether_ai_formats::ApiOperation>,
+) -> Option<SameFormatProviderRequestBodyOutput> {
+    let native_memories =
+        api_operation == Some(aether_ai_formats::ApiOperation::OpenAiMemoriesSummarize);
+    if native_memories
+        && (!aether_ai_formats::api_format_alias_matches(
+            input.provider_api_format,
+            "openai:responses",
+        ) || !aether_ai_formats::api_format_alias_matches(
+            input.client_api_format,
+            "openai:responses",
+        ) || input.kiro_auth_config.is_some()
+            || input.is_claude_code)
+    {
+        return None;
+    }
     let mut compatibility_edits = Vec::new();
     let body = build_same_format_provider_request_body_inner(
         input,
         Some(&mut compatibility_edits),
         reasoning_replay_policy,
+        native_memories,
     )?;
     Some(SameFormatProviderRequestBodyOutput {
         body,
@@ -355,7 +384,10 @@ pub fn enforce_same_format_provider_api_operation_body_policy(
 ) -> bool {
     if !matches!(
         api_operation,
-        Some(aether_ai_formats::ApiOperation::ClaudeCountTokens)
+        Some(
+            aether_ai_formats::ApiOperation::ClaudeCountTokens
+                | aether_ai_formats::ApiOperation::OpenAiMemoriesSummarize
+        )
     ) {
         return false;
     }
@@ -367,6 +399,7 @@ fn build_same_format_provider_request_body_inner(
     input: SameFormatProviderRequestBodyInput<'_>,
     mut compatibility_edits: Option<&mut Vec<SameFormatProviderCompatibilityEdit>>,
     reasoning_replay_policy: aether_ai_formats::OpenAiResponsesReasoningReplayPolicy,
+    native_memories: bool,
 ) -> Option<Value> {
     if let Some(kiro_auth_config) = input.kiro_auth_config {
         let body = build_kiro_provider_request_body(
@@ -523,6 +556,11 @@ fn build_same_format_provider_request_body_inner(
             "applied configured provider body rules",
         );
     }
+    if native_memories {
+        // 记忆端点使用原生 JSON，不注入 Responses 的 input/store/include/stream，
+        // 也不通过 Responses 规则归一化 traces。
+        return Some(provider_request_body);
+    }
     if matches!(input.family, SameFormatProviderFamily::Gemini)
         && aether_ai_formats::api_format_alias_matches(
             input.provider_api_format,
@@ -544,7 +582,8 @@ fn build_same_format_provider_request_body_inner(
             );
         }
     }
-    if matches!(input.family, SameFormatProviderFamily::Gemini)
+    if input.is_vertex
+        && matches!(input.family, SameFormatProviderFamily::Gemini)
         && aether_ai_formats::api_format_alias_matches(
             input.provider_api_format,
             "gemini:generate_content",
@@ -812,7 +851,7 @@ pub fn build_same_format_provider_headers(
     } else {
         replace_upstream_auth_headers(&mut provider_request_headers, "", "");
     }
-    let claude_code_profile = *current_claude_code_transport_identity_profile();
+    let claude_code_profile = current_claude_code_transport_identity_profile();
     if input.behavior.is_claude_code_transport {
         claude_code_profile.apply_fixed_headers(
             &mut provider_request_headers,
@@ -992,6 +1031,40 @@ mod tests {
     };
     use serde_json::json;
 
+    #[test]
+    fn memories_preserves_native_traces_and_does_not_apply_responses_stream_policy() {
+        let body = json!({"model": "memory-global", "reasoning": {"effort": "high"},
+            "traces": [{"id": "synthetic-trace", "items": [{"future": 7}]}],
+            "future_request": {"opaque": [1, 2, 3]}});
+        let input = SameFormatProviderRequestBodyInput {
+            body_json: &body,
+            mapped_model: "memory-upstream",
+            client_api_format: "openai:responses",
+            provider_api_format: "openai:responses",
+            source_model: Some("memory-global"),
+            family: SameFormatProviderFamily::Standard,
+            body_rules: None,
+            request_headers: None,
+            upstream_is_stream: false,
+            force_body_stream_field: true,
+            kiro_auth_config: None,
+            is_claude_code: false,
+            is_vertex: false,
+            enable_model_directives: false,
+        };
+        let result = build_same_format_provider_request_body_for_operation(
+            input,
+            aether_ai_formats::OpenAiResponsesReasoningReplayPolicy::OpenAiItemIds,
+            Some(aether_ai_formats::ApiOperation::OpenAiMemoriesSummarize),
+        )
+        .unwrap();
+        let mut expected = body.clone();
+        expected["model"] = json!("memory-upstream");
+        assert_eq!(result.body, expected);
+        assert!(result.body.get("input").is_none());
+        assert!(result.body.get("stream").is_none());
+    }
+
     fn sample_transport(provider_type: &str) -> GatewayProviderTransportSnapshot {
         GatewayProviderTransportSnapshot {
             provider: GatewayProviderTransportProvider {
@@ -1159,6 +1232,7 @@ mod tests {
                 force_body_stream_field: false,
                 kiro_auth_config: None,
                 is_claude_code: behavior.is_claude_code,
+                is_vertex: false,
                 enable_model_directives: false,
             })
             .expect("body should build")
@@ -1189,7 +1263,7 @@ mod tests {
         );
         assert_eq!(
             build_body(compat_behavior)["system"][0]["text"],
-            "x-anthropic-billing-header: cc_version=2.1.161.abc; cc_entrypoint=cli;"
+            "x-anthropic-billing-header: cc_version=2.1.284.abc; cc_entrypoint=cli;"
         );
 
         let mut legacy = sample_transport("claude_code");
@@ -1489,6 +1563,7 @@ mod tests {
                     force_body_stream_field: behavior.force_body_stream_field,
                     kiro_auth_config: None,
                     is_claude_code: false,
+                    is_vertex: false,
                     enable_model_directives: false,
                 })
                 .expect("body should build");
@@ -1663,6 +1738,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -1692,6 +1768,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("same-format body should bypass canonical conversion");
@@ -1779,6 +1856,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("valid GPT-5.6 Responses request should use raw same-format transport");
@@ -1809,6 +1887,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("final GPT-5.6 provider model should accept prompt_cache_options");
@@ -1833,6 +1912,7 @@ mod tests {
                 force_body_stream_field: false,
                 kiro_auth_config: None,
                 is_claude_code: false,
+                is_vertex: false,
                 enable_model_directives: false,
             });
         assert!(rejected.is_none());
@@ -1859,6 +1939,7 @@ mod tests {
                 force_body_stream_field: false,
                 kiro_auth_config: None,
                 is_claude_code: false,
+                is_vertex: false,
                 enable_model_directives: false,
             })
         };
@@ -1887,6 +1968,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         });
 
@@ -1914,6 +1996,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         });
 
@@ -1941,6 +2024,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         });
 
@@ -1968,6 +2052,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         });
 
@@ -1993,6 +2078,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -2019,6 +2105,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -2045,6 +2132,7 @@ mod tests {
             force_body_stream_field: true,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -2071,6 +2159,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -2097,6 +2186,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -2123,6 +2213,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -2135,7 +2226,7 @@ mod tests {
     }
 
     #[test]
-    fn same_format_gemini_body_strips_function_response_id_for_upstream() {
+    fn same_format_gemini_body_preserves_function_response_id_for_native_upstream() {
         let body = build_same_format_provider_request_body(SameFormatProviderRequestBodyInput {
             body_json: &json!({
                 "contents": [
@@ -2177,12 +2268,13 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
 
         let function_response = &body["contents"][0]["parts"][0]["functionResponse"];
-        assert!(function_response.get("id").is_none());
+        assert_eq!(function_response["id"], "call_123");
         assert_eq!(function_response["name"], "lookup");
         assert_eq!(
             function_response["response"]["result"]["id"],
@@ -2190,7 +2282,7 @@ mod tests {
         );
 
         let function_response = &body["contents"][0]["parts"][1]["function_response"];
-        assert!(function_response.get("id").is_none());
+        assert_eq!(function_response["id"], "call_456");
         assert_eq!(function_response["name"], "lookup_snake");
     }
 
@@ -2227,6 +2319,7 @@ mod tests {
                 force_body_stream_field: false,
                 kiro_auth_config: None,
                 is_claude_code: false,
+                is_vertex: false,
                 enable_model_directives: false,
             },
         )
@@ -2288,6 +2381,7 @@ mod tests {
                 force_body_stream_field: false,
                 kiro_auth_config: None,
                 is_claude_code: false,
+                is_vertex: true,
                 enable_model_directives: false,
             },
         )
@@ -2347,6 +2441,7 @@ mod tests {
                 force_body_stream_field: false,
                 kiro_auth_config: None,
                 is_claude_code: false,
+                is_vertex: false,
                 enable_model_directives: false,
             },
         )
@@ -2399,6 +2494,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         };
 
@@ -2455,6 +2551,7 @@ mod tests {
                 force_body_stream_field: false,
                 kiro_auth_config: None,
                 is_claude_code: false,
+                is_vertex: false,
                 enable_model_directives: false,
             },
             aether_ai_formats::OpenAiResponsesReasoningReplayPolicy::DeepSeekOpaque,
@@ -2492,6 +2589,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -2522,6 +2620,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: false,
         })
         .expect("body should build");
@@ -2550,6 +2649,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: true,
         })
         .expect("body should build");
@@ -2582,6 +2682,7 @@ mod tests {
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
+            is_vertex: false,
             enable_model_directives: true,
         })
         .expect("search body should build");

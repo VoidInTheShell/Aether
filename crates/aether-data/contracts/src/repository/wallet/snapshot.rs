@@ -105,6 +105,12 @@ impl WalletReadSnapshot {
                     .as_deref()
                     .is_none_or(|expected| wallet.status == expected)
             })
+            .filter(|wallet| {
+                query
+                    .user_id
+                    .as_deref()
+                    .is_none_or(|expected| wallet.user_id.as_deref() == Some(expected))
+            })
             .filter(|wallet| match query.owner_type.as_deref() {
                 Some("user") => wallet.user_id.is_some(),
                 Some("api_key") => wallet.api_key_id.is_some(),
@@ -220,6 +226,17 @@ impl WalletReadSnapshot {
         page(items, offset, limit, |items, total| {
             StoredAdminWalletTransactionPage { items, total }
         })
+    }
+
+    pub fn find_admin_wallet_transaction(
+        &self,
+        wallet_id: &str,
+        transaction_id: &str,
+    ) -> Option<StoredAdminWalletTransaction> {
+        self.wallet_transactions
+            .get(transaction_id)
+            .filter(|tx| tx.wallet_id == wallet_id)
+            .cloned()
     }
 
     pub fn list_admin_wallet_refunds(

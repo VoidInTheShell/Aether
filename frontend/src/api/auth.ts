@@ -21,6 +21,7 @@ export interface UserPreferences {
   theme?: 'light' | 'dark' | 'auto'
   language?: string
   notifications_enabled?: boolean
+  allow_wallet_overage?: boolean
   [key: string]: unknown // 允许扩展其他偏好设置
 }
 
@@ -197,6 +198,11 @@ export const authApi = {
       '/api/auth/verify-email',
       { email, code, verification_token: verificationToken }
     )
+    return response.data
+  },
+
+  async validateInviteCode(code: string): Promise<{ valid: boolean; reason?: string }> {
+    const response = await apiClient.get<{ valid: boolean; reason?: string }>('/api/auth/invite-code', { params: { code } })
     return response.data
   },
 

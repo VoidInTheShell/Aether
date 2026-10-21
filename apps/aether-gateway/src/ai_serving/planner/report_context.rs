@@ -6,6 +6,11 @@ use aether_ai_serving::{
     provider_stream_event_api_format_for_provider_type as ai_provider_stream_event_api_format_for_provider_type,
     AiExecutionReportContextParts, AiRequestOrigin, STICKY_KEY_ATTEMPTS_REPORT_FIELD,
 };
+use aether_data_contracts::repository::usage::{
+    BillingMultiplierSnapshot, BILLING_MULTIPLIER_SNAPSHOT_METADATA_KEY,
+    CHAT_PII_REDACTION_METADATA_KEY, ROUTING_GROUP_BILLING_MULTIPLIER_METADATA_KEY,
+    ROUTING_GROUP_ID_METADATA_KEY, ROUTING_GROUP_NAME_METADATA_KEY,
+};
 use aether_routing_core::ResolvedRoutingPolicy;
 use aether_runtime_state::RuntimeLockLease;
 use aether_scheduler_core::{ClientSessionAffinity, SchedulerRankingOutcome};
@@ -70,6 +75,31 @@ pub(crate) struct LocalExecutionReportContextParts<'a> {
     pub(crate) extra_fields: Map<String, Value>,
 }
 
+/// 把“本请求确实命中过敏感信息脱敏”写进 report context，最终投影为使用记录的
+/// `chat_pii_redaction` 元数据。
+///
+/// HTTP 路径由 planner 的脱敏结果直接给出命中事实（`request_redacted`）；
+/// Responses WebSocket 路径在规划前就完成了脱敏，planner 看到的事件已是占位符态，
+/// 命中事实由 [`crate::privacy::ChatPiiRedactionTurnMarker`] 扩展带进来。
+/// 只在真正发生替换时写入，避免把“功能开着”误标成“这次脱敏了”。
+pub(crate) fn mark_chat_pii_redaction(
+    extra_fields: &mut Map<String, Value>,
+    parts: &http::request::Parts,
+    request_redacted: bool,
+) {
+    if request_redacted
+        || parts
+            .extensions
+            .get::<crate::privacy::ChatPiiRedactionTurnMarker>()
+            .is_some()
+    {
+        extra_fields.insert(
+            CHAT_PII_REDACTION_METADATA_KEY.to_string(),
+            Value::Bool(true),
+        );
+    }
+}
+
 pub(crate) fn build_local_execution_report_context(
     parts: LocalExecutionReportContextParts<'_>,
 ) -> Value {
@@ -87,6 +117,46 @@ pub(crate) fn build_local_execution_report_context(
         parts.original_request_body_base64,
     );
     let mut extra_fields = parts.extra_fields;
+    // Always overwrite caller-supplied extras with the planner's immutable policy snapshot.
+    let billing_multiplier = parts
+        .routing_policy
+        .map(|policy| policy.billing_multiplier)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(1.0);
+    extra_fields.insert(
+        ROUTING_GROUP_BILLING_MULTIPLIER_METADATA_KEY.to_string(),
+        Value::from(billing_multiplier),
+    );
+    extra_fields.insert(
+        BILLING_MULTIPLIER_SNAPSHOT_METADATA_KEY.to_string(),
+        serde_json::to_value(
+            BillingMultiplierSnapshot::from_factors(BTreeMap::from([(
+                "routing_group".to_string(),
+                billing_multiplier,
+            )]))
+            .expect("validated routing multiplier must produce a billing snapshot"),
+        )
+        .expect("validated billing snapshot must serialize"),
+    );
+    for (field, value) in [
+        (
+            ROUTING_GROUP_ID_METADATA_KEY,
+            parts
+                .routing_policy
+                .and_then(|policy| policy.group_id.as_deref()),
+        ),
+        (
+            ROUTING_GROUP_NAME_METADATA_KEY,
+            parts
+                .routing_policy
+                .and_then(|policy| policy.group_name.as_deref()),
+        ),
+    ] {
+        extra_fields.remove(field);
+        if let Some(value) = value {
+            extra_fields.insert(field.to_string(), Value::String(value.to_string()));
+        }
+    }
     if let Some(value) = parts
         .client_session_affinity
         .and_then(client_session_affinity_report_context_value)
@@ -341,6 +411,27 @@ mod tests {
             Some("codex".to_string()),
             Some("account=account-1;session=session-1".to_string()),
         );
+        let mut routing_policy = aether_routing_core::resolve_routing_policy(
+            &aether_routing_core::RoutingGroupConfig {
+                billing_multiplier: 0.25,
+                ..Default::default()
+            },
+            aether_routing_core::RoutingPolicyInput {
+                group_id: Some("group-1"),
+                group_version: Some(7),
+                selection_source: "system_default",
+                requested_model: "gpt-5",
+                resolved_model: "gpt-5",
+                api_format: "openai:chat",
+                user_id: None,
+                api_key_id: None,
+                headers: &json!({}),
+                body: &json!({}),
+                phase: aether_routing_core::RoutingRulePhase::ClientRequest,
+            },
+        )
+        .expect("routing policy should resolve");
+        routing_policy.group_name = Some("请求时的分组".to_string());
 
         let report_context =
             build_local_execution_report_context(LocalExecutionReportContextParts {
@@ -379,16 +470,35 @@ mod tests {
                 original_request_body_json: Some(&json!({"model": "gpt-5"})),
                 original_request_body_base64: None,
                 client_session_affinity: Some(&client_session_affinity),
-                routing_policy: None,
+                routing_policy: Some(&routing_policy),
                 scheduler_affinity_epoch: None,
                 sticky_key_attempts: None,
                 client_requested_stream: false,
                 upstream_is_stream: false,
                 has_envelope: false,
                 needs_conversion: false,
-                extra_fields: Map::new(),
+                extra_fields: Map::from_iter([
+                    (
+                        "billing_multiplier_snapshot".to_string(),
+                        json!({
+                            "version": 1, "factors": {"routing_group": 99.0}, "multiplier": 99.0
+                        }),
+                    ),
+                    ("routing_group_billing_multiplier".to_string(), json!(99)),
+                    ("routing_group_id".to_string(), json!("forged-group")),
+                    ("routing_group_name".to_string(), json!("forged-name")),
+                ]),
             });
 
+        assert_eq!(report_context["routing_group_billing_multiplier"], 0.25);
+        assert_eq!(
+            report_context["billing_multiplier_snapshot"],
+            json!({
+                "version": 1, "factors": {"routing_group": 0.25}, "multiplier": 0.25
+            })
+        );
+        assert_eq!(report_context["routing_group_id"], "group-1");
+        assert_eq!(report_context["routing_group_name"], "请求时的分组");
         assert_eq!(
             report_context["client_ip"],
             Value::String("203.0.113.8".to_string())
@@ -553,6 +663,33 @@ mod tests {
                 "ja4": "ja4-value",
                 "protocol": "TLSv1.3"
             })
+        );
+    }
+
+    #[test]
+    fn marks_chat_pii_redaction_only_when_content_was_replaced() {
+        let (parts, _) = http::Request::new(()).into_parts();
+        let mut extra_fields = Map::new();
+        super::mark_chat_pii_redaction(&mut extra_fields, &parts, false);
+        assert!(extra_fields.is_empty(), "未命中不得写入脱敏标记");
+
+        let mut extra_fields = Map::new();
+        super::mark_chat_pii_redaction(&mut extra_fields, &parts, true);
+        assert_eq!(
+            extra_fields.get(super::CHAT_PII_REDACTION_METADATA_KEY),
+            Some(&Value::Bool(true))
+        );
+
+        // Responses WebSocket 在规划前完成脱敏，事实只能靠扩展带进 planner。
+        let (mut ws_parts, _) = http::Request::new(()).into_parts();
+        ws_parts
+            .extensions
+            .insert(crate::privacy::ChatPiiRedactionTurnMarker);
+        let mut extra_fields = Map::new();
+        super::mark_chat_pii_redaction(&mut extra_fields, &ws_parts, false);
+        assert_eq!(
+            extra_fields.get(super::CHAT_PII_REDACTION_METADATA_KEY),
+            Some(&Value::Bool(true))
         );
     }
 }

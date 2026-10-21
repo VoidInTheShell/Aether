@@ -92,6 +92,8 @@ vi.mock('lucide-vue-next', async () => {
     EyeOff: Icon,
     Search: Icon,
     Shuffle: Icon,
+    Ban: Icon,
+    ShieldCheck: Icon,
     ChevronDown: Icon,
     Check: Icon,
   }
@@ -187,6 +189,100 @@ afterEach(() => {
 })
 
 describe('UsageRecordsTable', () => {
+  it.each([
+    [{ routing_group_name: '生产策略', routing_group_id: 'group-1' }, '生产策略'],
+    [{ routing_group_name: ' ', routing_group_id: 'group-history' }, 'group-history'],
+    [{}, '未记录分组'],
+  ])('shows group then the provider Key in desktop and mobile layouts', (group, expected) => {
+    const root = mountUsageRecordsTable([buildRecord({
+      ...group,
+      provider: '上游 A',
+      provider_key_name: '供应商 Key',
+      api_key: { id: 'user-key', name: '用户 API Key', display: 'sk-user' },
+    })])
+    expect([...root.querySelectorAll('[data-usage-provider="routing-group"]')].map(element => element.textContent?.trim()))
+      .toEqual([expected, expected])
+    const providerLines = [...root.querySelectorAll<HTMLElement>('[data-usage-provider="provider-key"]')]
+    expect(providerLines.map(element => element.textContent?.trim())).toEqual(['上游 A · 供应商 Key', '上游 A · 供应商 Key'])
+    for (const providerLine of providerLines) {
+      expect(providerLine.previousElementSibling?.getAttribute('data-usage-provider')).toBe('routing-group')
+      expect(providerLine.title).toBe('上游 A · 供应商 Key')
+    }
+  })
+
+  it('does not substitute a user API Key when the provider Key is unavailable', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      provider: '上游 A',
+      api_key: { id: 'user-key', name: '用户 API Key', display: 'sk-user' },
+    })])
+    expect([...root.querySelectorAll('[data-usage-provider="provider-key"]')].map(element => element.textContent?.trim()))
+      .toEqual(['上游 A · -', '上游 A · -'])
+  })
+
+  it.each([
+    [0, '$0.00'],
+    [1, '$10.00'],
+    [0.5, '$5.00'],
+    [2, '$20.00'],
+    [undefined, '$3.00'],
+  ])('shows customer charges in both layouts for multiplier %s, including legacy charges', (multiplier, expected) => {
+    const root = mountUsageRecordsTable([buildRecord({
+      cost: 10,
+      actual_cost: 3,
+      rate_multiplier: 0.3,
+      billing_multiplier: multiplier as number | undefined,
+    })], { isAdmin: false })
+    const subtitles = [...root.querySelectorAll('[data-usage-cost="routing-group"]')]
+    expect(subtitles).toHaveLength(2)
+    expect(subtitles.map(element => element.textContent?.trim())).toEqual([expected, expected])
+    expect(subtitles.every(element => element.getAttribute('title') === '实际扣费')).toBe(true)
+    expect([...root.querySelectorAll('[data-usage-cost="base"]')].map(element => element.textContent?.trim())).toEqual(['$10.00', '$10.00'])
+    expect(root.querySelector('[data-usage-cost="provider-key"]')).toBeNull()
+    expect(root.querySelector('[data-usage-provider]')).toBeNull()
+  })
+
+  it('uses the historical customer charge independently of the administrator-only provider Key cost', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      cost: 10,
+      actual_cost: 3,
+      rate_multiplier: 0.3,
+      billing_multiplier: 2,
+      billing_cost: 19.99,
+    })], { showActualCost: true })
+    const subtitles = [...root.querySelectorAll('[data-usage-cost="routing-group"]')]
+    expect(subtitles.map(element => element.textContent?.trim())).toEqual(['$19.99', '$19.99'])
+    const keyCosts = [...root.querySelectorAll<HTMLElement>('[data-usage-cost="provider-key"]')]
+    expect(keyCosts.map(element => element.textContent?.trim())).toEqual(['$3.00', '$3.00'])
+    expect(keyCosts.every(element => element.title.includes('提供商 Key 成本'))).toBe(true)
+  })
+
+  it('does not replace an unavailable customer charge with the base or provider Key cost', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      cost: 10,
+      actual_cost: 3,
+      rate_multiplier: 0.3,
+      billing_multiplier: 2,
+      billing_cost: null,
+    })], { showActualCost: true })
+    expect(root.querySelector('[data-usage-cost="routing-group"]')).toBeNull()
+    expect([...root.querySelectorAll('[data-usage-cost="base"]')].map(element => element.textContent?.trim()))
+      .toEqual(['$10.00', '$10.00'])
+    expect([...root.querySelectorAll('[data-usage-cost="provider-key"]')].map(element => element.textContent?.trim()))
+      .toEqual(['$3.00', '$3.00'])
+  })
+
+  it.each(['usage_available', 'usage_pricing_available'] as const)('hides all numeric costs when %s is false', field => {
+    const root = mountUsageRecordsTable([buildRecord({
+      [field]: false,
+      actual_cost: 3,
+      rate_multiplier: 0.3,
+      billing_multiplier: 2,
+      billing_cost: 0.02,
+    })], { showActualCost: true })
+    expect(root.querySelector('[data-usage-cost]')).toBeNull()
+    expect(root.querySelectorAll(field === 'usage_available' ? '[data-usage-unavailable="cost"]' : '[data-usage-unpriced="cost"]')).toHaveLength(2)
+  })
+
   it('shows output TPS after the request completes', () => {
     const root = mountUsageRecordsTable([buildRecord()])
 
@@ -439,6 +535,42 @@ describe('UsageRecordsTable', () => {
       .toBe('Fast')
   })
 
+  it('shows the Gemini thinkingLevel reasoning effort next to the model name', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      model: 'gemini-3.8-flash',
+      requested_reasoning_effort: 'high',
+      reasoning_effort: 'high',
+    })])
+
+    expect(root.textContent).toContain('gemini-3.8-flash')
+    const badge = root.querySelector('[data-usage-model-badge="reasoning"]')
+    expect(badge?.textContent?.trim()).toBe('high')
+    expect(badge?.getAttribute('title')).toBe('Reasoning: high')
+  })
+
+  it('shows the Gemini thinkingLevel mapping when request and provider disagree', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      model: 'gemini-3.8-flash',
+      requested_reasoning_effort: 'xhigh',
+      reasoning_effort: 'high',
+    })])
+
+    expect(root.textContent).toContain('xhigh -> high')
+    expect(root.querySelector('[data-usage-model-badge="reasoning"]')?.textContent?.trim())
+      .toBe('xhigh -> high')
+  })
+
+  it('shows a disabled Gemini thinkingBudget as none', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      model: 'gemini-3.8-flash',
+      requested_reasoning_effort: null,
+      reasoning_effort: 'none',
+    })])
+
+    expect(root.querySelector('[data-usage-model-badge="reasoning"]')?.textContent?.trim())
+      .toBe('none')
+  })
+
   it('shows request reasoning effort while the record is pending', () => {
     const root = mountUsageRecordsTable([buildRecord({
       status: 'pending',
@@ -460,10 +592,11 @@ describe('UsageRecordsTable', () => {
       .toBe('会话压缩')
   })
 
-  it('shows mapping, reasoning, Fast, and Cyber in the model area', () => {
+  it('shows mapping and response models as separately labelled facts', () => {
     const root = mountUsageRecordsTable([buildRecord({
       model: 'gpt-5',
       target_model: 'gpt-5.1',
+      response_model: 'gpt-5.2',
       requested_reasoning_effort: 'xhigh',
       reasoning_effort: 'max',
       service_tier: 'priority',
@@ -476,6 +609,8 @@ describe('UsageRecordsTable', () => {
 
     expect(root.textContent).toContain('gpt-5')
     expect(root.textContent).toContain('gpt-5.1')
+    expect(root.textContent).toContain('映射模型')
+    expect(root.textContent).toContain('响应模型')
     expect(root.textContent).toContain('xhigh -> max')
     expect(root.textContent).toContain('Fast')
     const reasoningBadge = root.querySelector<HTMLElement>('[data-usage-model-badge="reasoning"]')
@@ -509,13 +644,33 @@ describe('UsageRecordsTable', () => {
     expect(inlineLayout).not.toBeNull()
     const modelRow = inlineLayout?.firstElementChild
     expect(modelRow?.textContent).toContain('gpt-5')
-    expect(modelRow?.textContent).toContain('->')
-    expect(modelRow?.textContent).toContain('gpt-5.1')
-    expect(modelRow?.querySelector('[data-usage-model-target]')?.classList.contains('basis-full')).toBe(true)
-    expect(modelRow?.querySelector('[data-usage-model-target]')?.classList.contains('order-last')).toBe(true)
+    expect(modelRow?.querySelector('[data-usage-model-mapping]')?.textContent).toContain('映射模型')
+    expect(modelRow?.querySelector('[data-usage-model-response]')?.textContent).toContain('响应模型')
     expect(modelRow?.querySelector('[data-usage-model-badge="reasoning"]')?.textContent).toContain('xhigh -> max')
     expect(modelRow?.querySelector('[data-usage-model-badge="fast"]')?.textContent).toContain('Fast')
     expect(modelRow?.querySelector('[data-usage-model-badge="cyber"]')?.textContent).toContain('Cyber')
+  })
+
+  it('shows a response model without inventing a mapping arrow or using model_version', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      response_model: 'gpt-5.1',
+      model_version: 'legacy-version',
+      target_model: null,
+    })])
+
+    expect(root.querySelector('[data-usage-model-mapping]')).toBeNull()
+    expect(root.querySelector('[data-usage-model-response]')?.textContent).toContain('响应模型')
+    expect(root.textContent).not.toContain('legacy-version')
+    expect(root.textContent).not.toContain('->')
+  })
+
+  it('hides a response model when it matches the request model', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      response_model: 'gpt-5',
+      target_model: null,
+    })])
+
+    expect(root.querySelector('[data-usage-model-response]')).toBeNull()
   })
 
   it('stacks three model badges even without a model mapping', () => {
@@ -556,6 +711,37 @@ describe('UsageRecordsTable', () => {
       expect(badge.textContent).not.toContain('→')
       expect(badge.textContent).not.toContain('待确认')
       expect(badge.textContent).not.toContain('未确认')
+    },
+  )
+
+  it.each(['ultrafast', 'flex', 'future-tier', ' UltraFast '])(
+    'shows the final provider request tier %s without a fixed badge allowlist',
+    (requested) => {
+      const root = mountUsageRecordsTable([buildRecord({
+        service_tier: requested,
+        actual_service_tier: 'default',
+      })])
+      const badges = [...root.querySelectorAll<HTMLElement>('[data-usage-model-badge="service-tier"]')]
+      expect(badges.length).toBeGreaterThan(0)
+      for (const badge of badges) {
+        expect(badge.textContent?.trim()).toBe(requested.trim())
+        expect(badge.title).toBe(`上游请求档位：${requested.trim()}\n计费档位：${requested.trim()}`)
+        expect(badge.getAttribute('aria-label')).toBe(
+          `上游请求档位：${requested.trim()}，计费档位：${requested.trim()}`,
+        )
+      }
+    },
+  )
+
+  it.each(['auto', 'default', 'standard', ' DEFAULT ', '', ' ', null])(
+    'does not show a badge for the default or absent request tier %s',
+    (requested) => {
+      const root = mountUsageRecordsTable([buildRecord({
+        service_tier: requested,
+        actual_service_tier: 'ultrafast',
+      })])
+      expect(root.querySelector('[data-usage-model-badge="service-tier"]')).toBeNull()
+      expect(root.querySelector('[data-usage-model-badge="fast"]')).toBeNull()
     },
   )
 
@@ -678,5 +864,59 @@ describe('UsageRecordsTable', () => {
 
     expect(root.querySelector('[data-usage-attempt-marker="fallback"]')).not.toBeNull()
     expect(root.querySelector('[data-usage-attempt-marker="retry"]')).not.toBeNull()
+  })
+
+  it('shows the PII redaction marker in both admin and user layouts', () => {
+    const adminRoot = mountUsageRecordsTable([buildRecord({ chat_pii_redaction: true })])
+    const adminMarkers = [...adminRoot.querySelectorAll('[data-usage-attempt-marker="pii-redaction"]')]
+    expect(adminMarkers).toHaveLength(2)
+    for (const marker of adminMarkers) {
+      expect(marker.getAttribute('aria-label')).toBe('触发敏感信息保护')
+      expect(marker.getAttribute('title')).toContain('上游')
+    }
+
+    const userRoot = mountUsageRecordsTable(
+      [buildRecord({ chat_pii_redaction: true })],
+      { isAdmin: false },
+    )
+    expect([...userRoot.querySelectorAll('[data-usage-attempt-marker="pii-redaction"]')]).toHaveLength(2)
+  })
+
+  it('hides the PII redaction marker when the request was never redacted', () => {
+    const root = mountUsageRecordsTable([buildRecord({ chat_pii_redaction: false })])
+    expect(root.querySelector('[data-usage-attempt-marker="pii-redaction"]')).toBeNull()
+  })
+
+  it('shows the skipped-candidate marker when a candidate was skipped by scheduling', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      has_skipped_candidate: true,
+      skipped_candidate_reasons: ['key_rpm_exhausted'],
+    })])
+
+    const marker = root.querySelector('[data-usage-attempt-marker="skipped-candidate"]')
+    expect(marker).not.toBeNull()
+    // tooltip 必须说明"请求未发往该候选"，否则用户会以为上游报了错
+    const title = marker?.getAttribute('title') ?? ''
+    expect(title).toContain('调度阶段被跳过')
+    expect(title).toContain('不会有上游报错')
+    expect(title).toContain('密钥本分钟请求数已达上限')
+  })
+
+  it('prefers the fallback marker over the skipped-candidate marker', () => {
+    // 真正发生过故障转移时，琥珀色转移图标信息量更大，不再叠加灰色角标
+    const root = mountUsageRecordsTable([buildRecord({
+      has_fallback: true,
+      has_skipped_candidate: true,
+      skipped_candidate_reasons: ['key_rpm_exhausted'],
+    })])
+
+    expect(root.querySelector('[data-usage-attempt-marker="fallback"]')).not.toBeNull()
+    expect(root.querySelector('[data-usage-attempt-marker="skipped-candidate"]')).toBeNull()
+  })
+
+  it('hides the skipped-candidate marker when no candidate was skipped', () => {
+    const root = mountUsageRecordsTable([buildRecord({ has_skipped_candidate: false })])
+
+    expect(root.querySelector('[data-usage-attempt-marker="skipped-candidate"]')).toBeNull()
   })
 })

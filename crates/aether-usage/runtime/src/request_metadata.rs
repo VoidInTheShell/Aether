@@ -1,14 +1,19 @@
 use aether_contracts::ExecutionPlan;
 use aether_data_contracts::repository::usage::{
     extract_provider_actual_service_tier_from_response,
-    extract_provider_reasoning_effort_from_body, extract_provider_service_tier_from_body,
-    normalize_provider_service_tier, resolve_provider_cache_ttl_minutes,
+    extract_provider_reasoning_effort_from_body, extract_provider_response_model_from_bodies,
+    extract_provider_service_tier_from_body, normalize_provider_service_tier,
+    resolve_provider_cache_ttl_minutes,
     sanitize_usage_request_metadata as project_usage_request_metadata,
     sanitize_usage_request_metadata_object as project_usage_request_metadata_object,
     sanitize_usage_request_metadata_ref as project_usage_request_metadata_ref,
-    UsageBodyCaptureState, PROVIDER_ACTUAL_SERVICE_TIER_METADATA_KEY,
-    PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY, PROVIDER_REASONING_EFFORT_METADATA_KEY,
+    usage_body_capture_is_authoritative, UsageBodyCaptureState,
+    BILLING_MULTIPLIER_SNAPSHOT_METADATA_KEY, CHAT_PII_REDACTION_METADATA_KEY,
+    PROVIDER_ACTUAL_SERVICE_TIER_METADATA_KEY, PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY,
+    PROVIDER_REASONING_EFFORT_METADATA_KEY, PROVIDER_RESPONSE_MODEL_METADATA_KEY,
     PROVIDER_SERVICE_TIER_METADATA_KEY, REQUESTED_REASONING_EFFORT_METADATA_KEY,
+    ROUTING_GROUP_BILLING_MULTIPLIER_METADATA_KEY, ROUTING_GROUP_ID_METADATA_KEY,
+    ROUTING_GROUP_NAME_METADATA_KEY,
 };
 use serde_json::{Map, Value};
 
@@ -99,6 +104,7 @@ pub(crate) fn retain_first_byte_request_metadata(value: Option<Value>) -> Option
                 | "client_requested_stream"
                 | "upstream_is_stream"
                 | "api_key_is_standalone"
+                | "plan_wallet_fallback"
                 | "plan_usage_reservation_token"
                 | "request_path"
                 | "request_query_string"
@@ -110,6 +116,11 @@ pub(crate) fn retain_first_byte_request_metadata(value: Option<Value>) -> Option
                 | "model_id"
                 | "global_model_id"
                 | "global_model_name"
+                | ROUTING_GROUP_BILLING_MULTIPLIER_METADATA_KEY
+                | BILLING_MULTIPLIER_SNAPSHOT_METADATA_KEY
+                | ROUTING_GROUP_ID_METADATA_KEY
+                | ROUTING_GROUP_NAME_METADATA_KEY
+                | CHAT_PII_REDACTION_METADATA_KEY
         )
     });
     (!metadata.is_empty()).then_some(Value::Object(metadata))
@@ -249,6 +260,83 @@ pub(crate) fn attach_provider_response_body_metadata(
     attach_provider_actual_service_tier_metadata(metadata, actual_service_tier.as_deref())
 }
 
+pub(crate) fn attach_provider_response_model_metadata(
+    metadata: Option<Value>,
+    request_body: Option<&Value>,
+    request_body_state: Option<UsageBodyCaptureState>,
+    request_api_format: Option<&str>,
+    response_body: Option<&Value>,
+    response_body_state: Option<UsageBodyCaptureState>,
+    provider_api_format: Option<&str>,
+) -> Option<Value> {
+    let both_bodies_are_authoritative =
+        usage_body_capture_is_authoritative(request_body, request_body_state)
+            && usage_body_capture_is_authoritative(response_body, response_body_state);
+    let response_model = extract_provider_response_model_from_bodies(
+        request_body,
+        request_body_state,
+        request_api_format,
+        response_body,
+        response_body_state,
+        provider_api_format,
+    );
+    if !both_bodies_are_authoritative && response_model.is_none() {
+        return metadata;
+    }
+
+    let mut object = match metadata {
+        Some(Value::Object(object)) => object,
+        _ => Map::new(),
+    };
+    // 完整终态 body 是最终候选的权威事实；相同、无效或缺失模型都要清除旧候选值。
+    if both_bodies_are_authoritative {
+        object.remove(PROVIDER_RESPONSE_MODEL_METADATA_KEY);
+    }
+    if let Some(response_model) = response_model {
+        object.insert(
+            PROVIDER_RESPONSE_MODEL_METADATA_KEY.to_string(),
+            Value::String(response_model),
+        );
+    }
+    (!object.is_empty()).then_some(Value::Object(object))
+}
+
+/// 终态候选无法完成比较时，显式清除旧响应模型，避免重试/故障转移残留。
+pub(crate) fn refresh_provider_response_model_metadata(
+    metadata: Option<Value>,
+    request_body: Option<&Value>,
+    request_body_state: Option<UsageBodyCaptureState>,
+    request_api_format: Option<&str>,
+    response_body: Option<&Value>,
+    response_body_state: Option<UsageBodyCaptureState>,
+    provider_api_format: Option<&str>,
+) -> Option<Value> {
+    let mut object = match metadata {
+        Some(Value::Object(object)) => object,
+        _ => Map::new(),
+    };
+    object.remove(PROVIDER_RESPONSE_MODEL_METADATA_KEY);
+
+    if usage_body_capture_is_authoritative(request_body, request_body_state)
+        && usage_body_capture_is_authoritative(response_body, response_body_state)
+    {
+        if let Some(response_model) = extract_provider_response_model_from_bodies(
+            request_body,
+            request_body_state,
+            request_api_format,
+            response_body,
+            response_body_state,
+            provider_api_format,
+        ) {
+            object.insert(
+                PROVIDER_RESPONSE_MODEL_METADATA_KEY.to_string(),
+                Value::String(response_model),
+            );
+        }
+    }
+    (!object.is_empty()).then_some(Value::Object(object))
+}
+
 /// Refreshes the response-derived tier for a terminal snapshot. Complete response objects are
 /// authoritative even when they contain no tier (which clears a stale candidate value). Capture
 /// placeholders/absent bodies are not authoritative, so a terminal summary already present in
@@ -312,6 +400,7 @@ pub(crate) fn attach_provider_actual_service_tier_metadata(
 #[cfg(test)]
 mod tests {
     use aether_contracts::{ExecutionPlan, RequestBody};
+    use aether_data_contracts::repository::usage::UsageBodyCaptureState;
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
 
@@ -323,8 +412,9 @@ mod tests {
     use super::{
         attach_client_request_body_metadata, attach_provider_actual_service_tier_metadata,
         attach_provider_request_body_metadata, attach_provider_response_body_metadata,
-        build_usage_request_metadata_seed, merge_usage_request_metadata,
-        merge_usage_request_metadata_owned, refresh_provider_response_body_metadata,
+        attach_provider_response_model_metadata, build_usage_request_metadata_seed,
+        merge_usage_request_metadata, merge_usage_request_metadata_owned,
+        refresh_provider_response_body_metadata, refresh_provider_response_model_metadata,
         retain_first_byte_request_metadata, sanitize_usage_request_metadata,
         sanitize_usage_request_metadata_ref,
     };
@@ -460,7 +550,12 @@ mod tests {
             "client_ip": "203.0.113.8",
             "request_path": "/v1/chat/completions",
             "upstream_is_stream": true,
+            "chat_pii_redaction": true,
             "proxy": {"mode": "manual", "node_id": "proxy-1"},
+            "routing_group_billing_multiplier": 0.25,
+            "billing_multiplier_snapshot": {"version": 1, "factors": {"routing_group": 0.25, "user_group": 2.0}, "multiplier": 0.5},
+            "routing_group_id": "group-1",
+            "routing_group_name": "默认调度策略",
             "billing_snapshot": {"dimensions": [1, 2, 3]},
             "settlement_snapshot": {"status": "pending"},
             "stage_timings_ms": {"planning": 12}
@@ -474,7 +569,12 @@ mod tests {
                 "client_ip": "203.0.113.8",
                 "request_path": "/v1/chat/completions",
                 "request_path_and_query": "/v1/chat/completions",
-                "upstream_is_stream": true
+                "upstream_is_stream": true,
+                "chat_pii_redaction": true,
+                "routing_group_billing_multiplier": 0.25,
+                "billing_multiplier_snapshot": {"version": 1, "factors": {"routing_group": 0.25, "user_group": 2.0}, "multiplier": 0.5},
+                "routing_group_id": "group-1",
+                "routing_group_name": "默认调度策略"
             })
         );
     }
@@ -561,6 +661,52 @@ mod tests {
             }
         })))
         .is_none());
+    }
+
+    #[test]
+    fn routing_group_snapshot_survives_seed_and_sanitization() {
+        for multiplier in [0.0, 0.25, 1.0, 2.5] {
+            let context = json!({
+                "routing_group_billing_multiplier": multiplier,
+                "billing_multiplier_snapshot": {"version": 1, "factors": {"routing_group": multiplier, "user_group": 2.0}, "multiplier": multiplier * 2.0},
+                "routing_group_id": "group-1",
+                "routing_group_name": "请求时的分组",
+                "rate_multiplier": 0.75,
+                "routing_trace": {"untrusted": true}
+            });
+            let metadata = build_usage_request_metadata_seed(&sample_plan(), context.as_object())
+                .expect("group snapshot should survive projection");
+            assert_eq!(metadata["routing_group_billing_multiplier"], multiplier);
+            assert_eq!(
+                metadata["billing_multiplier_snapshot"],
+                context["billing_multiplier_snapshot"]
+            );
+            assert_eq!(metadata["routing_group_id"], "group-1");
+            assert_eq!(metadata["routing_group_name"], "请求时的分组");
+            assert_eq!(metadata["rate_multiplier"], 0.75);
+            assert!(metadata.get("routing_trace").is_none());
+            assert_eq!(
+                sanitize_usage_request_metadata(Some(metadata.clone())),
+                Some(metadata)
+            );
+        }
+        for multiplier in [json!(-1), json!("Infinity"), json!(f64::NAN)] {
+            let context = json!({"routing_group_billing_multiplier": multiplier});
+            let metadata = build_usage_request_metadata_seed(&sample_plan(), context.as_object())
+                .expect(
+                "invalid pricing must retain a marker instead of falling back to legacy billing",
+            );
+            assert_eq!(
+                metadata.get("billing_multiplier_snapshot"),
+                Some(&Value::Null)
+            );
+            assert!(
+                aether_data_contracts::repository::usage::billing_multiplier_snapshot(Some(
+                    &metadata
+                ))
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -664,6 +810,39 @@ mod tests {
     }
 
     #[test]
+    fn gemini_thinking_config_is_derived_into_client_and_provider_reasoning_metadata() {
+        let client_body = json!({
+            "generationConfig": {
+                "thinkingConfig": { "includeThoughts": true, "thinkingLevel": "HIGH" }
+            }
+        });
+        let provider_body = json!({
+            "generation_config": {
+                "thinking_config": { "thinking_budget": 8192 }
+            }
+        });
+
+        let metadata = attach_client_request_body_metadata(
+            Some(json!({ "trace_id": "trace-1" })),
+            Some(&client_body),
+        )
+        .expect("metadata should remain");
+        assert_eq!(metadata["requested_reasoning_effort"], "high");
+
+        let metadata = attach_provider_request_body_metadata(
+            Some(metadata),
+            Some("gemini:generate_content"),
+            Some("gemini-3.8-flash"),
+            Some("gemini-3.8-flash"),
+            Some(&provider_body),
+        )
+        .expect("metadata should remain");
+
+        assert_eq!(metadata["requested_reasoning_effort"], "high");
+        assert_eq!(metadata["provider_reasoning_effort"], "xhigh");
+    }
+
+    #[test]
     fn provider_request_body_metadata_uses_final_provider_body_as_source_of_truth() {
         let metadata = Some(json!({
             "trace_id": "trace-1",
@@ -748,6 +927,7 @@ mod tests {
         apply_usage_body_capture_policy_to_event(
             UsageBodyCapturePolicy {
                 record_level: UsageRequestRecordLevel::Basic,
+                ..UsageBodyCapturePolicy::default()
             },
             &mut event,
         );
@@ -800,6 +980,44 @@ mod tests {
                 "provider_actual_service_tier": "default"
             })
         );
+    }
+
+    #[test]
+    fn response_model_metadata_is_independent_from_mapping_and_clears_stale_values() {
+        let metadata = attach_provider_response_model_metadata(
+            Some(json!({"provider_response_model": "old-model", "trace_id": "trace-1"})),
+            Some(&json!({"model": "gpt-5"})),
+            Some(UsageBodyCaptureState::Inline),
+            Some("openai:chat"),
+            Some(&json!({"model": "gpt-5.1"})),
+            Some(UsageBodyCaptureState::Inline),
+            Some("openai:chat"),
+        )
+        .expect("response model should be attached");
+        assert_eq!(metadata["provider_response_model"], "gpt-5.1");
+        assert_eq!(metadata["trace_id"], "trace-1");
+
+        let metadata = refresh_provider_response_model_metadata(
+            Some(json!({"provider_response_model": "gpt-5.1"})),
+            Some(&json!({"model": "gpt-5"})),
+            Some(UsageBodyCaptureState::Inline),
+            Some("openai:chat"),
+            Some(&json!({"model": "gpt-5"})),
+            Some(UsageBodyCaptureState::Inline),
+            Some("openai:chat"),
+        );
+        assert!(metadata.is_none());
+
+        let metadata = refresh_provider_response_model_metadata(
+            Some(json!({"provider_response_model": "gpt-5.1"})),
+            None,
+            Some(UsageBodyCaptureState::Disabled),
+            Some("openai:chat"),
+            Some(&json!({"model": "gpt-5.2"})),
+            Some(UsageBodyCaptureState::Inline),
+            Some("openai:chat"),
+        );
+        assert!(metadata.is_none());
     }
 
     #[test]

@@ -176,6 +176,10 @@ SELECT
   NULL::bytea AS client_response_body_compressed,
   CASE
     WHEN NULLIF(BTRIM("usage".request_metadata->>'client_ip'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->>'routing_group_id'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->>'routing_group_name'), '') IS NOT NULL
+      OR json_typeof("usage".request_metadata->'routing_group_billing_multiplier') = 'number'
+      OR "usage".request_metadata->'billing_multiplier_snapshot' IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'user_agent'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'request_path'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'request_path_and_query'), '') IS NOT NULL
@@ -183,15 +187,27 @@ SELECT
       OR NULLIF(BTRIM("usage".request_metadata->>'provider_reasoning_effort'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'provider_service_tier'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'provider_actual_service_tier'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->>'provider_response_model'), '') IS NOT NULL
       OR ("usage".request_metadata->>'client_requested_stream') IN ('true', 'false')
       OR ("usage".request_metadata->>'upstream_is_stream') IN ('true', 'false')
       OR ("usage".request_metadata->>'websocket_mode') IN ('true', 'false')
       OR NULLIF(BTRIM("usage".request_metadata->>'websocket_transport'), '') IS NOT NULL
       OR ("usage".request_metadata->>'usage_available') IN ('true', 'false')
       OR ("usage".request_metadata->>'usage_pricing_available') IN ('true', 'false')
+      OR json_typeof("usage".request_metadata->'chat_pii_redaction') = 'boolean'
       OR json_typeof("usage".request_metadata->'live_session') = 'object'
       OR json_typeof("usage".request_metadata->'realtime_session') = 'object'
-      THEN jsonb_strip_nulls(jsonb_build_object(
+      THEN (jsonb_strip_nulls(jsonb_build_object(
+        'routing_group_id',
+        NULLIF(BTRIM("usage".request_metadata->>'routing_group_id'), ''),
+        'routing_group_name',
+        NULLIF(BTRIM("usage".request_metadata->>'routing_group_name'), ''),
+        'routing_group_billing_multiplier',
+        CASE
+          WHEN json_typeof("usage".request_metadata->'routing_group_billing_multiplier') = 'number'
+            THEN "usage".request_metadata->'routing_group_billing_multiplier'
+          ELSE NULL
+        END,
         'client_ip',
         NULLIF(BTRIM("usage".request_metadata->>'client_ip'), ''),
         'user_agent',
@@ -208,6 +224,8 @@ SELECT
         NULLIF(BTRIM("usage".request_metadata->>'provider_service_tier'), ''),
         'provider_actual_service_tier',
         NULLIF(BTRIM("usage".request_metadata->>'provider_actual_service_tier'), ''),
+        'provider_response_model',
+        NULLIF(BTRIM("usage".request_metadata->>'provider_response_model'), ''),
         'client_requested_stream',
         CASE
           WHEN ("usage".request_metadata->>'client_requested_stream') IN ('true', 'false')
@@ -240,6 +258,12 @@ SELECT
             THEN ("usage".request_metadata->>'usage_pricing_available')::boolean
           ELSE NULL
         END,
+        'chat_pii_redaction',
+        CASE
+          WHEN json_typeof("usage".request_metadata->'chat_pii_redaction') = 'boolean'
+            THEN "usage".request_metadata->'chat_pii_redaction'
+          ELSE NULL
+        END,
         'live_session',
         CASE
           WHEN json_typeof("usage".request_metadata->'live_session') = 'object'
@@ -252,7 +276,11 @@ SELECT
             THEN "usage".request_metadata->'realtime_session'
           ELSE NULL
         END
-      ))::json
+      )) || CASE
+        WHEN "usage".request_metadata->'billing_multiplier_snapshot' IS NOT NULL
+          THEN jsonb_build_object('billing_multiplier_snapshot', "usage".request_metadata->'billing_multiplier_snapshot')
+        ELSE '{}'::jsonb
+      END)::json
     ELSE NULL::json
   END AS request_metadata,
   NULL::varchar AS http_request_body_ref,

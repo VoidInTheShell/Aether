@@ -11,6 +11,12 @@
       class="space-y-5"
       @submit.prevent="handleSubmit"
     >
+      <p
+        v-if="!isEditMode && routingGroupId"
+        class="rounded-lg bg-muted/40 px-3 py-2 text-sm text-muted-foreground"
+      >
+        新提供商仅在“{{ routingGroupName || '当前策略分组' }}”中启用，在其他策略分组中默认禁用。
+      </p>
       <!-- 基本信息 -->
       <div class="space-y-3">
         <h3 class="text-sm font-medium border-b pb-2">
@@ -250,12 +256,18 @@
           data-testid="codex-fingerprint-convergence-setting"
         >
           <div class="space-y-0.5">
-            <Label
-              for="codex-fingerprint-convergence"
-              class="text-sm font-medium"
-            >
-              {{ legacyT('Codex 指纹收敛') }}
-            </Label>
+            <div class="flex items-center gap-1">
+              <Label
+                for="codex-fingerprint-convergence"
+                class="text-sm font-medium"
+              >
+                {{ legacyT('Codex 指纹收敛（推荐开启）') }}
+              </Label>
+              <HelpHint
+                :label="legacyT('Codex 指纹收敛（推荐开启）')"
+                :text="legacyT('开启后，Aether 会根据当前账号身份为出站请求统一生成并写入以下标识，使同一 Codex 账号在上游看来始终是同一设备与会话：\n\n• 请求头：installation_id、session_id、thread_id、window_id、turn_id 等\n• 请求体（Responses 格式）：client_metadata 与 prompt_cache_key 中的对应字段\n\n关闭时保持客户端原始透传，不做任何改写。建议开启以提升上游指纹稳定性与会话连续性。')"
+              />
+            </div>
             <p class="text-xs text-muted-foreground leading-relaxed">
               {{ legacyT('统一同一 Codex 身份的设备与会话标识；关闭时保持现有透传行为。') }}
             </p>
@@ -263,7 +275,7 @@
           <Switch
             id="codex-fingerprint-convergence"
             :model-value="form.codex_fingerprint_convergence_enabled"
-            :aria-label="legacyT('Codex 指纹收敛')"
+            :aria-label="legacyT('Codex 指纹收敛（推荐开启）')"
             @update:model-value="(v: boolean) => form.codex_fingerprint_convergence_enabled = v"
           />
         </div>
@@ -280,7 +292,7 @@
               {{ legacyT('Responses WebSocket 模式') }}
             </Label>
             <p class="text-xs text-muted-foreground leading-relaxed">
-              {{ legacyT('允许此提供商处理标准 Responses API WebSocket 请求。仅在已验证兼容性后启用。') }}
+              {{ legacyT('允许此提供商处理标准 Responses API WebSocket 请求。') }}
             </p>
           </div>
           <Switch
@@ -336,6 +348,7 @@ import {
   Switch,
 } from '@/components/ui'
 import { Server, SquarePen } from 'lucide-vue-next'
+import HelpHint from '@/components/common/HelpHint.vue'
 import { useToast } from '@/composables/useToast'
 import { useFormDialog } from '@/composables/useFormDialog'
 import { useI18n } from '@/i18n'
@@ -352,6 +365,8 @@ import { parseNumberInput } from '@/utils/form'
 const props = defineProps<{
   modelValue: boolean
   provider?: ProviderWithEndpointsSummary | null  // 编辑模式时传入
+  routingGroupId?: string
+  routingGroupName?: string
   maxPriority?: number  // 当前已有的最大优先级值
 }>()
 
@@ -543,8 +558,8 @@ const handleSubmit = async () => {
       emit('providerUpdated', updated)
     } else {
       // 创建提供商（优先级由后端自动置顶）
-      await createProvider(basePayload)
-      success(legacyT('提供商已创建，请继续添加端点和密钥，或在优先级管理中调整顺序'), legacyT('创建成功'))
+      await createProvider({ ...basePayload, routing_group_id: props.routingGroupId })
+      success(legacyT('提供商已创建，可添加端点和密钥，并在目录中调整调度顺序'), legacyT('创建成功'))
       emit('providerCreated')
     }
 

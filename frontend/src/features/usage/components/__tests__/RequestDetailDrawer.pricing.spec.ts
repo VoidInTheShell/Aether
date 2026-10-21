@@ -113,6 +113,80 @@ function buildFastTierDetail(): RequestDetail {
 }
 
 describe('RequestDetailDrawer settlement pricing', () => {
+  it('emits request redaction facts without promising response restoration for a failed request', async () => {
+    apiMocks.getRequestDetail.mockResolvedValue({
+      ...buildEmbeddingDetail(),
+      chat_pii_redaction: true,
+      status: 'failed',
+      status_code: 502,
+    } satisfies RequestDetail)
+    const updates = vi.fn()
+    const isOpen = ref(false)
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp({
+      setup: () => () => h(RequestDetailDrawer, {
+        isOpen: isOpen.value,
+        requestId: 'usage-embedding-1',
+        onRequestState: updates,
+      }),
+    })
+    app.mount(root)
+    mountedApps.push({ app, root })
+    isOpen.value = true
+    await nextTick()
+
+    await vi.waitFor(() => expect(updates).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'usage-embedding-1',
+      chatPiiRedaction: true,
+    })))
+    const notice = document.body.querySelector('[data-request-detail-pii-redaction]')
+    expect(notice?.textContent).toContain('敏感信息替换为占位符')
+    expect(notice?.textContent).not.toContain('已还原')
+  })
+
+  it.each([
+    { billingMultiplier: 0, billingCost: 0 },
+    { billingMultiplier: undefined, billingCost: undefined },
+    { billingMultiplier: 2, billingCost: null },
+  ])('preserves zero, missing, and explicitly unavailable billing facts in list updates: %o', async ({ billingMultiplier, billingCost }) => {
+    apiMocks.getRequestDetail.mockResolvedValue({
+      ...buildEmbeddingDetail(),
+      billing_multiplier: billingMultiplier,
+      billing_cost: billingCost,
+      routing_group_id: 'group-1',
+      routing_group_name: '历史分组',
+      actual_cost: 0.000005,
+    } satisfies RequestDetail)
+    const updates = vi.fn()
+    let isOpen!: Ref<boolean>
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp({
+      setup() {
+        isOpen = ref(false)
+        return () => h(RequestDetailDrawer, {
+          isOpen: isOpen.value,
+          requestId: 'usage-embedding-1',
+          onRequestState: updates,
+        })
+      },
+    })
+    app.mount(root)
+    mountedApps.push({ app, root })
+    isOpen.value = true
+    await nextTick()
+    await vi.waitFor(() => expect(updates).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'usage-embedding-1',
+      cost: 0.00001,
+      actualCost: 0.000005,
+      billingMultiplier,
+      billingCost,
+      routingGroupId: 'group-1',
+      routingGroupName: '历史分组',
+    })))
+  })
+
   it('labels an unmetered OpenAI Live WebSocket detail without rendering zero usage as billing', async () => {
     apiMocks.getRequestDetail.mockResolvedValue({
       ...buildEmbeddingDetail(),
@@ -309,26 +383,31 @@ describe('RequestDetailDrawer settlement pricing', () => {
     })
   })
 
-  it('shows mapping, reasoning, Fast, and Cyber together in the model header', async () => {
+  it.each([
+    { tier: 'priority', label: 'Fast', badgeKey: 'fast' },
+    { tier: 'ultrafast', label: 'ultrafast', badgeKey: 'service-tier' },
+    { tier: 'future-tier', label: 'future-tier', badgeKey: 'service-tier' },
+  ])('shows mapping, response model, reasoning, $tier, and Cyber together in the model header', async ({ tier, label, badgeKey }) => {
     apiMocks.getRequestDetail.mockResolvedValue({
       ...buildEmbeddingDetail(),
       id: 'usage-cyber-risk-demo',
       request_id: 'req_usage-cyber-risk-demo',
       model: 'gpt-5',
       target_model: 'gpt-5.1',
+      response_model: 'gpt-5.2',
       requested_reasoning_effort: 'xhigh',
       reasoning_effort: 'max',
       request_body: {
         model: 'gpt-5',
         reasoning: { effort: 'xhigh' },
       },
-      service_tier: 'priority',
+      service_tier: tier,
       // A response-side tier must not be used for the Fast badge or billing.
       actual_service_tier: 'default',
       provider_request_body: {
         model: 'gpt-5.1',
         reasoning: { effort: 'max' },
-        service_tier: 'priority',
+        service_tier: tier,
       },
       status: 'failed',
       status_code: 400,
@@ -369,10 +448,8 @@ describe('RequestDetailDrawer settlement pricing', () => {
         .toContain('gpt-5.1')
       expect(document.body.querySelector('[data-request-detail-model-badge="reasoning"]')?.textContent)
         .toContain('xhigh -> max')
-      expect(document.body.querySelector('[data-request-detail-model-badge="fast"]')?.textContent)
-        .toContain('Fast')
-      expect(document.body.querySelector('[data-request-detail-model-badge="fast"]')?.textContent?.trim())
-        .toBe('Fast')
+      expect(document.body.querySelector(`[data-request-detail-model-badge="${badgeKey}"]`)?.textContent?.trim())
+        .toBe(label)
       expect(document.body.querySelector('[data-request-detail-model-badge="cyber"]')?.textContent)
         .toContain('Cyber')
       const modelLayout = document.body.querySelector(
@@ -380,14 +457,15 @@ describe('RequestDetailDrawer settlement pricing', () => {
       )
       const modelRow = modelLayout?.firstElementChild
       expect(modelRow?.textContent).toContain('gpt-5')
-      expect(modelRow?.textContent).toContain('->')
-      expect(modelRow?.textContent).toContain('gpt-5.1')
-      expect(modelRow?.querySelector('[data-usage-model-target]')?.classList.contains('basis-full'))
-        .toBe(true)
+      expect(modelRow?.classList.contains('flex-wrap')).toBe(true)
+      expect(modelRow?.querySelector('[data-usage-model-mapping]')?.textContent)
+        .toContain('gpt-5.1')
+      expect(modelRow?.querySelector('[data-usage-model-response]')?.textContent)
+        .toContain('gpt-5.2')
       expect(modelRow?.querySelector('[data-request-detail-model-badge="reasoning"]')?.textContent)
         .toContain('xhigh -> max')
-      expect(modelRow?.querySelector('[data-request-detail-model-badge="fast"]')?.textContent)
-        .toContain('Fast')
+      expect(modelRow?.querySelector(`[data-request-detail-model-badge="${badgeKey}"]`)?.textContent)
+        .toContain(label)
       expect(modelRow?.querySelector('[data-request-detail-model-badge="cyber"]')?.textContent)
         .toContain('Cyber')
       expect(modelLayout?.querySelector('[data-request-detail-model-badges-row]')).toBeNull()
@@ -395,7 +473,7 @@ describe('RequestDetailDrawer settlement pricing', () => {
       expect([...serviceTierFacts?.querySelectorAll('dt') ?? []].map(node => node.textContent?.trim()))
         .toEqual(['上游请求层级', '计费层级'])
       expect([...serviceTierFacts?.querySelectorAll('dd') ?? []].map(node => node.textContent?.trim()))
-        .toEqual(['Fast', 'Fast'])
+        .toEqual([label, label])
     })
   })
 
@@ -460,7 +538,7 @@ describe('RequestDetailDrawer settlement pricing', () => {
     await vi.waitFor(() => {
       expect(document.body.querySelector('[data-request-detail-model-badge="cyber"]')?.textContent)
         .toContain('Cyber')
-      expect(document.body.querySelector('[data-usage-model-target]')?.textContent)
+      expect(document.body.querySelector('[data-usage-model-mapping]')?.textContent)
         .toContain('gpt-5.1')
       expect(document.body.querySelector('[data-request-detail-model-badge="reasoning"]')?.textContent)
         .toContain('xhigh -> max')
@@ -571,8 +649,8 @@ describe('RequestDetailDrawer settlement pricing', () => {
 
     await vi.waitFor(() => {
       expect(apiMocks.getRequestDetail).toHaveBeenCalledTimes(1)
-      expect(document.body.querySelector('[data-usage-model-target]')?.textContent?.trim())
-        .toBe('->gpt-5.1')
+      expect(document.body.querySelector('[data-usage-model-mapping]')?.textContent?.trim())
+        .toBe('映射模型gpt-5.1')
       expect(document.body.querySelector('[data-request-detail-model-badge="reasoning"]')?.textContent?.trim())
         .toBe('xhigh -> max')
       expect(document.body.querySelector('[data-request-detail-model-badge="fast"]')).toBeNull()
@@ -583,7 +661,7 @@ describe('RequestDetailDrawer settlement pricing', () => {
     })
   })
 
-  it('uses detail model_version when the lightweight summary has null model facts', async () => {
+  it('does not use legacy model_version as a response-model fallback', async () => {
     apiMocks.getRequestDetail.mockResolvedValue({
       ...buildEmbeddingDetail(),
       id: 'usage-version-summary',
@@ -626,8 +704,55 @@ describe('RequestDetailDrawer settlement pricing', () => {
     await nextTick()
 
     await vi.waitFor(() => {
-      expect(document.body.querySelector('[data-usage-model-target]')?.textContent?.trim())
-        .toBe('->gpt-5.1-2026-07-17')
+      expect(document.body.querySelector('[data-usage-model-response]')).toBeNull()
+      expect(document.body.querySelector('[data-usage-model-mapping]')).toBeNull()
+    })
+  })
+
+  it('shows the Gemini thinkingConfig reasoning effort in the model header', async () => {
+    apiMocks.getRequestDetail.mockResolvedValue({
+      ...buildEmbeddingDetail(),
+      id: 'usage-gemini-thinking',
+      request_id: 'usage-gemini-thinking',
+      model: 'gemini-3.8-flash',
+      request_type: 'chat',
+      requested_reasoning_effort: 'xhigh',
+      reasoning_effort: 'high',
+      request_body: {
+        generationConfig: {
+          thinkingConfig: { includeThoughts: true, thinkingLevel: 'HIGH' },
+        },
+      },
+      provider_request_body: {
+        generationConfig: { thinkingConfig: { thinkingBudget: 8192 } },
+      },
+    })
+
+    let isOpen!: Ref<boolean>
+    const Host = defineComponent({
+      setup() {
+        isOpen = ref(false)
+        return () => h(RequestDetailDrawer, {
+          isOpen: isOpen.value,
+          requestId: 'usage-gemini-thinking',
+        })
+      },
+    })
+
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(Host)
+    app.mount(root)
+    mountedApps.push({ app, root })
+
+    isOpen.value = true
+    await nextTick()
+
+    await vi.waitFor(() => {
+      expect(document.body.querySelector('[data-request-detail-model-display]')?.textContent)
+        .toContain('gemini-3.8-flash')
+      expect(document.body.querySelector('[data-request-detail-model-badge="reasoning"]')?.textContent?.trim())
+        .toBe('xhigh -> high')
     })
   })
 
@@ -687,7 +812,7 @@ describe('RequestDetailDrawer settlement pricing', () => {
     }
     await nextTick()
 
-    expect(document.body.querySelector('[data-usage-model-target]')).toBeNull()
+    expect(document.body.querySelector('[data-usage-model-mapping]')).toBeNull()
     expect(document.body.querySelector('[data-request-detail-model-badge="reasoning"]')?.textContent?.trim())
       .toBe('xhigh')
     expect(document.body.querySelector('[data-request-detail-model-badge="fast"]')).toBeNull()

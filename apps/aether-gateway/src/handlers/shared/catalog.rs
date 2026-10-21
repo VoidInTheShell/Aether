@@ -21,6 +21,7 @@ use aether_crypto::{
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
 use aether_provider_pool::{
     grok_pool_tier_from_quota_bucket, grok_supported_quota_windows_for_tier,
+    provider_pool_codex_metadata_has_account_quota,
 };
 use aether_scheduler_core::provider_key_circuit_payload_is_active_open_at;
 use serde_json::{json, Map, Value};
@@ -1111,9 +1112,8 @@ fn build_codex_quota_status_snapshot(
     source: &str,
 ) -> Option<Value> {
     let metadata = provider_quota_metadata_bucket(upstream_metadata, "codex")?;
-    let observed_at_unix_secs = metadata
-        .get("updated_at")
-        .and_then(admin_provider_quota_pure::coerce_json_u64);
+    let observed_at_unix_secs = provider_quota_timestamp_unix_secs(metadata.get("observed_at"))
+        .or_else(|| provider_quota_timestamp_unix_secs(metadata.get("updated_at")));
     let plan_type = metadata
         .get("plan_type")
         .and_then(Value::as_str)
@@ -2294,6 +2294,111 @@ fn build_gemini_cli_quota_status_snapshot(
     }))
 }
 
+fn build_claude_code_quota_status_snapshot(
+    upstream_metadata: Option<&Value>,
+    source: &str,
+) -> Option<Value> {
+    let metadata = provider_quota_metadata_bucket(upstream_metadata, "claude_code")?;
+    let observed_at_unix_secs = provider_quota_timestamp_unix_secs(metadata.get("updated_at"));
+    // (metadata prefix, window code, window minutes, account-wide?). Display labels are
+    // resolved by the frontend from `code` so they follow the UI locale.
+    let definitions: [(&str, &str, u64, bool); 4] = [
+        ("five_hour", "5h", 300, true),
+        ("seven_day", "weekly", 10_080, true),
+        ("seven_day_sonnet", "weekly_sonnet", 10_080, false),
+        ("seven_day_fable", "weekly_fable", 10_080, false),
+    ];
+    let mut windows = Vec::new();
+    for (prefix, code, window_minutes, account_wide) in definitions {
+        let used_percent = metadata
+            .get(&format!("{prefix}_used_percent"))
+            .and_then(Value::as_f64);
+        let reset_at =
+            provider_quota_timestamp_unix_secs(metadata.get(&format!("{prefix}_reset_at")));
+        // A window whose reset time already passed no longer describes current usage.
+        let expired = reset_at
+            .zip(observed_at_unix_secs)
+            .is_some_and(|(reset_at, observed_at)| reset_at <= observed_at);
+        let Some(used_percent) = used_percent else {
+            continue;
+        };
+        let used_ratio = if expired {
+            0.0
+        } else {
+            (used_percent / 100.0).clamp(0.0, 1.0)
+        };
+        let reset_seconds = reset_at
+            .zip(observed_at_unix_secs)
+            .map(|(reset_at, observed_at)| reset_at.saturating_sub(observed_at));
+        let mut window = json!({
+            "code": code,
+            "scope": if account_wide { "account" } else { "model" },
+            "unit": "percent",
+            "used_ratio": used_ratio,
+            "remaining_ratio": 1.0 - used_ratio,
+            "reset_at": reset_at,
+            "reset_seconds": reset_seconds,
+            "window_minutes": window_minutes,
+            "is_exhausted": used_ratio >= 1.0 - 1e-6,
+        });
+        if !account_wide {
+            window["quota_group"] = json!(code);
+        }
+        windows.push(window);
+    }
+    if windows.is_empty() {
+        return None;
+    }
+
+    let account_windows = windows
+        .iter()
+        .filter(|window| window.get("scope").and_then(Value::as_str) == Some("account"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let blocking_windows = account_windows
+        .iter()
+        .filter(|window| window.get("is_exhausted").and_then(Value::as_bool) == Some(true))
+        .cloned()
+        .collect::<Vec<_>>();
+    let exhausted = !blocking_windows.is_empty();
+    // The account is usable again only once every exhausted window resets.
+    let reset_at = if exhausted {
+        blocking_windows
+            .iter()
+            .filter_map(|window| provider_quota_timestamp_unix_secs(window.get("reset_at")))
+            .max()
+    } else {
+        None
+    };
+    let reset_seconds = if exhausted {
+        blocking_windows
+            .iter()
+            .filter_map(|window| window.get("reset_seconds").and_then(Value::as_u64))
+            .max()
+    } else {
+        None
+    };
+
+    Some(json!({
+        "version": 2,
+        "provider_type": "claude_code",
+        "code": if exhausted { "exhausted" } else { "ok" },
+        "freshness": "fresh",
+        "source": source,
+        "observed_at": observed_at_unix_secs,
+        "exhausted": exhausted,
+        "usage_ratio": quota_windows_usage_ratio(&account_windows),
+        "updated_at": observed_at_unix_secs,
+        "reset_at": reset_at,
+        "reset_seconds": reset_seconds,
+        "reset_credits": build_codex_reset_credits_status_snapshot(
+            metadata,
+            observed_at_unix_secs,
+        ),
+        "windows": windows,
+    }))
+}
+
 fn build_codex_reset_credits_status_snapshot(
     metadata: &Map<String, Value>,
     observed_at_unix_secs: Option<u64>,
@@ -2423,6 +2528,7 @@ pub(crate) fn sync_provider_key_quota_status_snapshot(
         "antigravity" => build_antigravity_quota_status_snapshot(upstream_metadata, source),
         "grok" => build_grok_quota_status_snapshot(upstream_metadata, source),
         "gemini_cli" => build_gemini_cli_quota_status_snapshot(upstream_metadata, source),
+        "claude_code" => build_claude_code_quota_status_snapshot(upstream_metadata, source),
         _ => None,
     }?;
     if normalized_provider_type == "codex" {
@@ -2502,17 +2608,19 @@ fn codex_upstream_metadata_is_at_least_as_fresh(
     let Some(metadata) = provider_quota_metadata_bucket(upstream_metadata, "codex") else {
         return false;
     };
-    let Some(metadata_updated_at) = metadata
-        .get("updated_at")
-        .and_then(admin_provider_quota_pure::coerce_json_u64)
+    // Identity, reset-credit, and model-only updates do not replace the
+    // account's quota observation, even when their timestamp is newer.
+    if !provider_pool_codex_metadata_has_account_quota(metadata) {
+        return false;
+    }
+    let Some(metadata_updated_at) = provider_quota_timestamp_unix_secs(metadata.get("observed_at"))
+        .or_else(|| provider_quota_timestamp_unix_secs(metadata.get("updated_at")))
     else {
         return false;
     };
     let snapshot_updated_at = quota_snapshot.and_then(|quota| {
-        quota
-            .get("updated_at")
-            .or_else(|| quota.get("observed_at"))
-            .and_then(admin_provider_quota_pure::coerce_json_u64)
+        provider_quota_timestamp_unix_secs(quota.get("observed_at"))
+            .or_else(|| provider_quota_timestamp_unix_secs(quota.get("updated_at")))
     });
 
     snapshot_updated_at.is_none_or(|updated_at| metadata_updated_at >= updated_at)
@@ -2573,6 +2681,84 @@ fn windsurf_quota_snapshot_has_stale_cooldown(quota_snapshot: &Map<String, Value
     has_capacity || !exhausted
 }
 
+/// 读取状态快照时，把已越过重置时间点的配额窗口按“已重置”口径归一化。
+///
+/// 背景：调度侧早已把到期窗口视为未耗尽（`provider_pool_reset_deadline_elapsed`），
+/// 账号额度文本也会按到期强制显示 100%，但列表读取此前直接返回存量快照，
+/// 导致管理端倒计时归零后进度条仍停留在旧的剩余百分比。这里让读取层与
+/// 调度侧、文本侧使用同一口径，避免三处状态互相矛盾。
+///
+/// 覆盖所有带重置时间的提供商窗口（codex/kiro/xai/grok/antigravity/
+/// gemini_cli/chatgpt_web/windsurf 等）：比例（used_ratio/remaining_ratio）、
+/// 数值（used_value/remaining_value）与窗口级耗尽标记会一起恢复为“已重置”。
+fn normalize_expired_quota_windows(snapshot: &mut serde_json::Map<String, Value>) {
+    let Some(quota) = snapshot.get_mut("quota").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let fallback_observed_at = provider_quota_timestamp_unix_secs(quota.get("observed_at"))
+        .or_else(|| provider_quota_timestamp_unix_secs(quota.get("updated_at")));
+    let Some(windows) = quota.get_mut("windows").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for window in windows.iter_mut().filter_map(Value::as_object_mut) {
+        // 与同类窗口处理保持一致：window_minutes=0 不是真实配额窗口。
+        if window.get("window_minutes").and_then(Value::as_u64) == Some(0) {
+            continue;
+        }
+        if !aether_provider_pool::provider_pool_reset_deadline_elapsed(
+            window,
+            fallback_observed_at,
+            now_unix_secs,
+        ) {
+            continue;
+        }
+        // 只归一化“观测完整”的窗口：要么有比例观测，要么有上限 + 用量数值。
+        // 这样既不会把无数据窗口凭空显示成 100%，也不会出现比例已恢复 100%
+        // 而数值仍停留在旧值的不一致（例如只有 remaining_value 却没有上限的窗口）。
+        let has_ratio_observation = ["used_ratio", "remaining_ratio"]
+            .into_iter()
+            .any(|field| window.get(field).is_some_and(Value::is_number));
+        let limit_value = window
+            .get("limit_value")
+            .and_then(admin_provider_quota_pure::coerce_json_f64)
+            .filter(|value| *value > 0.0);
+        let has_value_observation = limit_value.is_some()
+            && ["used_value", "remaining_value"]
+                .into_iter()
+                .any(|field| window.get(field).is_some_and(Value::is_number));
+        if !has_ratio_observation && !has_value_observation {
+            continue;
+        }
+        // 比例口径：已用清零、剩余 100%；字段原本为 null 时一并补齐，保证展示口径统一。
+        for (field, value) in [("used_ratio", 0.0), ("remaining_ratio", 1.0)] {
+            if window.contains_key(field) {
+                window.insert(field.to_string(), json!(value));
+            }
+        }
+        // 数值口径：已用清零；有上限时把剩余恢复到上限（用于“剩余 x/y”类文本展示）。
+        if window.contains_key("used_value") {
+            window.insert("used_value".to_string(), json!(0.0));
+        }
+        if window.contains_key("remaining_value") {
+            if let Some(limit_value) = limit_value {
+                window.insert("remaining_value".to_string(), json!(limit_value));
+            }
+        }
+        // 同步清掉窗口级耗尽标记，避免展示与调度口径互相矛盾。
+        for field in ["is_exhausted", "exhausted"] {
+            if let Some(slot) = window.get_mut(field) {
+                *slot = json!(false);
+            }
+        }
+    }
+}
+
 pub(crate) fn provider_key_status_snapshot_payload(
     key: &StoredProviderCatalogKey,
     provider_type: &str,
@@ -2611,6 +2797,25 @@ pub(crate) fn provider_key_status_snapshot_payload(
     let mut snapshot = provider_key_status_snapshot_object(Some(&payload))
         .or_else(|| default_provider_key_status_snapshot().as_object().cloned())
         .unwrap_or_default();
+    // Legacy snapshots can retain an exhausted summary after a window reset or
+    // newer quota observation. Use the same decision as scheduling so the
+    // account list and its status filter do not keep displaying that stale block.
+    // 对所有提供商生效：适配器判定已是“重置感知”的，与调度口径保持一致。
+    // Evaluate the resolved payload, since the stored key may lack the quota
+    // snapshot that was just backfilled from upstream metadata.
+    let mut quota_key = key.clone();
+    quota_key.status_snapshot = Some(payload);
+    if !aether_provider_pool::provider_pool_key_account_quota_exhausted(&quota_key, provider_type) {
+        if let Some(quota) = snapshot.get_mut("quota").and_then(Value::as_object_mut) {
+            quota.insert("exhausted".to_string(), json!(false));
+            if quota.get("code").and_then(Value::as_str) == Some("exhausted") {
+                quota.insert("code".to_string(), json!("ok"));
+            }
+        }
+    }
+    // 读取时归一化已到期的配额窗口，保证列表进度条、额度文字与调度侧、
+    // 账号额度文本使用同一“已重置”口径。
+    normalize_expired_quota_windows(&mut snapshot);
     snapshot.insert(
         "oauth".to_string(),
         build_provider_key_oauth_status_snapshot(key),
@@ -3660,6 +3865,421 @@ mod tests {
     }
 
     #[test]
+    fn provider_key_status_snapshot_payload_normalizes_expired_codex_quota_windows() {
+        let mut key = sample_catalog_key();
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "codex",
+                "code": "ok",
+                "exhausted": false,
+                "updated_at": 1_700_000_000u64,
+                "windows": [
+                    {
+                        "code": "5h",
+                        "label": "5H",
+                        "scope": "account",
+                        "unit": "percent",
+                        "used_ratio": 0.88,
+                        "remaining_ratio": 0.12,
+                        "reset_at": 1_700_003_600u64,
+                        "window_minutes": 300
+                    },
+                    {
+                        "code": "weekly",
+                        "label": "周",
+                        "scope": "account",
+                        "unit": "percent",
+                        "used_ratio": 0.5,
+                        "remaining_ratio": 0.5,
+                        "reset_at": 2_000_000_000u64,
+                        "window_minutes": 10_080
+                    },
+                    {
+                        "code": "spark_5h",
+                        "label": "Spark 5H",
+                        "scope": "account",
+                        "unit": "percent",
+                        "reset_at": 1_700_003_600u64,
+                        "window_minutes": 300
+                    },
+                    {
+                        "code": "unlimited",
+                        "label": "无限",
+                        "scope": "account",
+                        "unit": "percent",
+                        "used_ratio": 0.3,
+                        "remaining_ratio": 0.7,
+                        "reset_at": 1_700_003_600u64,
+                        "window_minutes": 0
+                    }
+                ]
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "codex");
+
+        // 已到期的窗口按“已重置”口径归一化：用量清零、剩余 100%。
+        assert_eq!(payload.pointer("/quota/windows/0/code"), Some(&json!("5h")));
+        assert_eq!(
+            payload.pointer("/quota/windows/0/used_ratio"),
+            Some(&json!(0.0))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/remaining_ratio"),
+            Some(&json!(1.0))
+        );
+        // 未到期的窗口保留原始观测值。
+        assert_eq!(
+            payload.pointer("/quota/windows/1/code"),
+            Some(&json!("weekly"))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/1/used_ratio"),
+            Some(&json!(0.5))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/1/remaining_ratio"),
+            Some(&json!(0.5))
+        );
+        // 没有用量观测的窗口不会被凭空补成 100%。
+        assert_eq!(
+            payload.pointer("/quota/windows/2/code"),
+            Some(&json!("spark_5h"))
+        );
+        assert_eq!(payload.pointer("/quota/windows/2/used_ratio"), None);
+        assert_eq!(payload.pointer("/quota/windows/2/remaining_ratio"), None);
+        // window_minutes=0 不是真实配额窗口，与同类 Codex 窗口处理保持一致，不归一化。
+        assert_eq!(
+            payload.pointer("/quota/windows/3/code"),
+            Some(&json!("unlimited"))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/3/used_ratio"),
+            Some(&json!(0.3))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/3/remaining_ratio"),
+            Some(&json!(0.7))
+        );
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_clears_expired_codex_window_exhausted_state() {
+        let mut key = sample_catalog_key();
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "codex",
+                "code": "exhausted",
+                "exhausted": true,
+                "usage_ratio": 1.0,
+                "updated_at": 1_700_000_000u64,
+                "windows": [
+                    {
+                        "code": "weekly",
+                        "label": "周",
+                        "scope": "account",
+                        "unit": "percent",
+                        "used_ratio": 1.0,
+                        "remaining_ratio": 0.0,
+                        "reset_at": 1_700_003_600u64,
+                        "window_minutes": 10_080,
+                        "is_exhausted": true
+                    }
+                ]
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "codex");
+
+        // 汇总标志沿用既有调度口径（窗口已到期 → 不再视为耗尽）。
+        assert_eq!(payload.pointer("/quota/exhausted"), Some(&json!(false)));
+        assert_eq!(payload.pointer("/quota/code"), Some(&json!("ok")));
+        // 窗口级耗尽标记与剩余比例同步归一化。
+        assert_eq!(
+            payload.pointer("/quota/windows/0/is_exhausted"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/used_ratio"),
+            Some(&json!(0.0))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/remaining_ratio"),
+            Some(&json!(1.0))
+        );
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_normalizes_expired_quota_windows_for_other_providers() {
+        let mut key = sample_catalog_key();
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "kiro",
+                "code": "ok",
+                "exhausted": false,
+                "observed_at": 1_700_000_000u64,
+                "updated_at": 1_700_000_000u64,
+                "windows": [
+                    {
+                        "code": "usage",
+                        "label": "额度",
+                        "scope": "account",
+                        "unit": "count",
+                        "used_ratio": 0.4,
+                        "remaining_ratio": 0.6,
+                        "used_value": 60.0,
+                        "remaining_value": 90.0,
+                        "limit_value": 150.0,
+                        "reset_at": 1_700_003_600u64,
+                        "reset_seconds": 3_600u64
+                    },
+                    {
+                        "code": "usage_null_ratio",
+                        "label": "额度",
+                        "scope": "account",
+                        "unit": "count",
+                        "used_ratio": null,
+                        "remaining_ratio": null,
+                        "used_value": 60.0,
+                        "remaining_value": 90.0,
+                        "limit_value": 150.0,
+                        "reset_at": 1_700_003_600u64,
+                        "reset_seconds": 3_600u64
+                    },
+                    {
+                        "code": "usage_active",
+                        "label": "额度",
+                        "scope": "account",
+                        "unit": "count",
+                        "used_ratio": 0.4,
+                        "remaining_ratio": 0.6,
+                        "used_value": 60.0,
+                        "remaining_value": 90.0,
+                        "limit_value": 150.0,
+                        "reset_at": 2_000_000_000u64,
+                        "reset_seconds": 300_000_000u64
+                    },
+                    {
+                        "code": "usage_no_observation",
+                        "label": "额度",
+                        "scope": "account",
+                        "unit": "count",
+                        "reset_at": 1_700_003_600u64,
+                        "reset_seconds": 3_600u64
+                    },
+                    {
+                        "code": "usage_no_deadline",
+                        "label": "额度",
+                        "scope": "account",
+                        "unit": "count",
+                        "used_ratio": 0.4,
+                        "remaining_ratio": 0.6,
+                        "used_value": 60.0,
+                        "remaining_value": 90.0,
+                        "limit_value": 150.0
+                    },
+                    {
+                        "code": "usage_remaining_without_limit",
+                        "label": "额度",
+                        "scope": "account",
+                        "unit": "count",
+                        "used_ratio": null,
+                        "remaining_ratio": null,
+                        "remaining_value": 0.0,
+                        "reset_at": 1_700_003_600u64,
+                        "reset_seconds": 3_600u64
+                    }
+                ]
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "kiro");
+
+        // 已到期窗口：比例与数值一起按“已重置”归一化（不再只覆盖 Codex）。
+        assert_eq!(
+            payload.pointer("/quota/windows/0/used_ratio"),
+            Some(&json!(0.0))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/remaining_ratio"),
+            Some(&json!(1.0))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/used_value"),
+            Some(&json!(0.0))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/remaining_value"),
+            Some(&json!(150.0))
+        );
+        // 比例字段为 null 时补齐为已重置口径，保证优先读比例的展示实现一致。
+        assert_eq!(
+            payload.pointer("/quota/windows/1/used_ratio"),
+            Some(&json!(0.0))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/1/remaining_ratio"),
+            Some(&json!(1.0))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/1/used_value"),
+            Some(&json!(0.0))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/1/remaining_value"),
+            Some(&json!(150.0))
+        );
+        // 未到期窗口保留原始观测值。
+        assert_eq!(
+            payload.pointer("/quota/windows/2/used_ratio"),
+            Some(&json!(0.4))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/2/remaining_value"),
+            Some(&json!(90.0))
+        );
+        // 没有用量观测的窗口不会被凭空补成 100%。
+        assert_eq!(payload.pointer("/quota/windows/3/used_ratio"), None);
+        assert_eq!(payload.pointer("/quota/windows/3/remaining_ratio"), None);
+        // 没有重置时间的窗口无法判定是否已重置，保持原样。
+        assert_eq!(
+            payload.pointer("/quota/windows/4/used_ratio"),
+            Some(&json!(0.4))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/4/remaining_ratio"),
+            Some(&json!(0.6))
+        );
+        // 只有 remaining_value 却没有上限的窗口观测不完整，跳过归一化，
+        // 避免比例已恢复 100% 而数值仍停留在旧值。
+        assert_eq!(
+            payload.pointer("/quota/windows/5/remaining_ratio"),
+            Some(&json!(null))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/5/remaining_value"),
+            Some(&json!(0.0))
+        );
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_clears_expired_quota_exhausted_state_for_other_providers(
+    ) {
+        let mut key = sample_catalog_key();
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "kiro",
+                "code": "exhausted",
+                "label": "额度耗尽",
+                "reason": "额度已耗尽",
+                "exhausted": true,
+                "usage_ratio": 1.0,
+                "observed_at": 1_700_000_000u64,
+                "updated_at": 1_700_000_000u64,
+                "windows": [
+                    {
+                        "code": "usage",
+                        "label": "额度",
+                        "scope": "account",
+                        "unit": "count",
+                        "used_ratio": 1.0,
+                        "remaining_ratio": 0.0,
+                        "used_value": 150.0,
+                        "remaining_value": 0.0,
+                        "limit_value": 150.0,
+                        "reset_at": 1_700_003_600u64,
+                        "reset_seconds": 3_600u64,
+                        "is_exhausted": true
+                    }
+                ]
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "kiro");
+
+        // 汇总状态沿用调度口径（窗口已到期 → 不再视为耗尽），对所有提供商生效。
+        assert_eq!(payload.pointer("/quota/exhausted"), Some(&json!(false)));
+        assert_eq!(payload.pointer("/quota/code"), Some(&json!("ok")));
+        // 窗口比例、数值与耗尽标记同步归一化。
+        assert_eq!(
+            payload.pointer("/quota/windows/0/is_exhausted"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/used_ratio"),
+            Some(&json!(0.0))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/remaining_ratio"),
+            Some(&json!(1.0))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/used_value"),
+            Some(&json!(0.0))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/remaining_value"),
+            Some(&json!(150.0))
+        );
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_keeps_active_quota_exhausted_state_for_other_providers()
+    {
+        let mut key = sample_catalog_key();
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "kiro",
+                "code": "exhausted",
+                "label": "额度耗尽",
+                "exhausted": true,
+                "usage_ratio": 1.0,
+                "observed_at": 1_700_000_000u64,
+                "updated_at": 1_700_000_000u64,
+                "windows": [
+                    {
+                        "code": "usage",
+                        "label": "额度",
+                        "scope": "account",
+                        "unit": "count",
+                        "used_ratio": 1.0,
+                        "remaining_ratio": 0.0,
+                        "used_value": 150.0,
+                        "remaining_value": 0.0,
+                        "limit_value": 150.0,
+                        "reset_at": 2_000_000_000u64,
+                        "reset_seconds": 300_000_000u64,
+                        "is_exhausted": true
+                    }
+                ]
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "kiro");
+
+        // 未到期的耗尽状态保留，不能被读取层提前“恢复”。
+        assert_eq!(payload.pointer("/quota/exhausted"), Some(&json!(true)));
+        assert_eq!(payload.pointer("/quota/code"), Some(&json!("exhausted")));
+        assert_eq!(
+            payload.pointer("/quota/windows/0/is_exhausted"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/used_ratio"),
+            Some(&json!(1.0))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/remaining_ratio"),
+            Some(&json!(0.0))
+        );
+    }
+
+    #[test]
     fn provider_key_status_snapshot_payload_backfills_chatgpt_web_image_quota() {
         let mut key = sample_catalog_key();
         key.upstream_metadata = Some(json!({
@@ -3723,6 +4343,108 @@ mod tests {
     }
 
     #[test]
+    fn provider_key_status_snapshot_payload_backfills_claude_code_usage_windows() {
+        let observed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("current time should be after epoch")
+            .as_secs();
+        let mut key = sample_catalog_key();
+        key.upstream_metadata = Some(json!({
+            "claude_code": {
+                "updated_at": observed_at,
+                "five_hour_used_percent": 100.0,
+                "five_hour_reset_at": observed_at + 3_600,
+                "seven_day_used_percent": 40.0,
+                "seven_day_reset_at": observed_at + 400_000,
+                "seven_day_sonnet_used_percent": 10.0,
+                "seven_day_sonnet_reset_at": observed_at + 400_000,
+                "reset_credits": {
+                    "available_count": 2,
+                    "updated_at": observed_at,
+                    "detail_source": "claude_oauth_usage",
+                    "credits": [{
+                        "display_key": "Key-1",
+                        "status": "available",
+                        "expires_at": observed_at + 144_000
+                    }]
+                }
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "claude_code");
+        let quota = payload
+            .get("quota")
+            .and_then(Value::as_object)
+            .expect("quota snapshot should be object");
+        assert_eq!(quota.get("provider_type"), Some(&json!("claude_code")));
+        // An exhausted 5h window blocks the whole account until it resets.
+        assert_eq!(quota.get("exhausted"), Some(&json!(true)));
+        assert_eq!(quota.get("code"), Some(&json!("exhausted")));
+        assert_eq!(quota.get("reset_at"), Some(&json!(observed_at + 3_600)));
+        let windows = quota
+            .get("windows")
+            .and_then(Value::as_array)
+            .expect("windows should exist");
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[0]["code"], json!("5h"));
+        assert_eq!(windows[0]["scope"], json!("account"));
+        assert_eq!(windows[0]["window_minutes"], json!(300));
+        assert_eq!(windows[0]["is_exhausted"], json!(true));
+        assert_eq!(windows[1]["code"], json!("weekly"));
+        assert_eq!(windows[1]["used_ratio"], json!(0.4));
+        assert_eq!(windows[2]["code"], json!("weekly_sonnet"));
+        assert_eq!(windows[2]["scope"], json!("model"));
+        assert_eq!(quota["reset_credits"]["available_count"], json!(2));
+        assert_eq!(
+            quota["reset_credits"]["credits"][0]["remaining_seconds"],
+            json!(144_000u64)
+        );
+
+        // An incomplete stored summary must not override the backfilled usage.
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "provider_type": "claude_code",
+                "code": "ok",
+                "exhausted": false,
+                "updated_at": observed_at - 3_600,
+                "windows": []
+            }
+        }));
+        let payload = provider_key_status_snapshot_payload(&key, "claude_code");
+        assert_eq!(payload["quota"]["exhausted"], json!(true));
+        assert_eq!(payload["quota"]["code"], json!("exhausted"));
+        assert_eq!(payload["quota"]["windows"][0]["is_exhausted"], json!(true));
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_clears_expired_backfilled_claude_code_usage() {
+        let observed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("current time should be after epoch")
+            .as_secs()
+            - 7_200;
+        let mut key = sample_catalog_key();
+        key.upstream_metadata = Some(json!({
+            "claude_code": {
+                "updated_at": observed_at,
+                "five_hour_used_percent": 100.0,
+                "five_hour_reset_at": observed_at + 3_600,
+                "seven_day_used_percent": 40.0,
+                "seven_day_reset_at": observed_at + 400_000
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "claude_code");
+        let quota = &payload["quota"];
+        assert_eq!(quota["exhausted"], json!(false));
+        assert_eq!(quota["code"], json!("ok"));
+        assert_eq!(quota["windows"][0]["is_exhausted"], json!(false));
+        assert_eq!(quota["windows"][0]["used_ratio"], json!(0.0));
+        assert_eq!(quota["windows"][0]["remaining_ratio"], json!(1.0));
+        assert_eq!(quota["windows"][1]["used_ratio"], json!(0.4));
+    }
+
+    #[test]
     fn provider_key_status_snapshot_payload_backfills_grok_model_quota() {
         let mut key = sample_catalog_key();
         key.upstream_metadata = Some(json!({
@@ -3737,14 +4459,14 @@ mod tests {
                         "used_percent": 60.0,
                         "remaining": 60.0,
                         "total": 150.0,
-                        "reset_at": 1_778_157_172u64,
+                        "reset_at": 2_000_000_000u64,
                         "is_exhausted": false
                     },
                     "quota_heavy": {
                         "display_name": "heavy",
                         "remaining_fraction": 0.0,
                         "used_percent": 100.0,
-                        "reset_at": 1_778_157_172u64,
+                        "reset_at": 2_000_000_000u64,
                         "is_exhausted": true
                     }
                 }
@@ -3767,7 +4489,7 @@ mod tests {
         assert_eq!(quota.get("pool_tier"), Some(&json!("heavy")));
         assert_eq!(quota.get("exhausted"), Some(&json!(false)));
         assert_eq!(quota.get("usage_ratio"), Some(&json!(1.0)));
-        assert_eq!(quota.get("reset_at"), Some(&json!(1_778_157_172u64)));
+        assert_eq!(quota.get("reset_at"), Some(&json!(2_000_000_000u64)));
         assert_eq!(windows.len(), 2);
         assert!(windows.iter().any(|window| {
             window
@@ -3880,8 +4602,8 @@ mod tests {
                 "plan_name": "Pro",
                 "daily_remaining_percent": 40.0,
                 "weekly_remaining_percent": 65.0,
-                "daily_reset_at": 1_778_100_000u64,
-                "weekly_reset_at": 1_778_600_000u64,
+                "daily_reset_at": 2_000_000_000u64,
+                "weekly_reset_at": 2_000_600_000u64,
                 "prompt_used": 12.0,
                 "prompt_limit": 100.0,
                 "prompt_remaining": 88.0,
@@ -3916,13 +4638,13 @@ mod tests {
         assert_eq!(quota.get("code"), Some(&json!("ok")));
         assert_eq!(quota.get("plan_type"), Some(&json!("Pro")));
         assert_eq!(quota.get("usage_ratio"), Some(&json!(0.6)));
-        assert_eq!(quota.get("reset_at"), Some(&json!(1_778_100_000u64)));
+        assert_eq!(quota.get("reset_at"), Some(&json!(2_000_000_000u64)));
         assert_eq!(daily.get("remaining_ratio"), Some(&json!(0.4)));
         assert_eq!(daily.get("used_ratio"), Some(&json!(0.6)));
-        assert_eq!(daily.get("reset_seconds"), Some(&json!(32_754u64)));
+        assert_eq!(daily.get("reset_seconds"), Some(&json!(221_932_754u64)));
         assert_eq!(weekly.get("remaining_ratio"), Some(&json!(0.65)));
         assert_eq!(weekly.get("used_ratio"), Some(&json!(0.35)));
-        assert_eq!(weekly.get("reset_seconds"), Some(&json!(532_754u64)));
+        assert_eq!(weekly.get("reset_seconds"), Some(&json!(222_532_754u64)));
         assert_eq!(quota.get("allowed_models_count"), Some(&json!(82)));
     }
 
@@ -4211,6 +4933,116 @@ mod tests {
                 .and_then(|window| window.get("used_ratio")),
             Some(&json!(0.25))
         );
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_clears_stale_codex_exhaustion_summary() {
+        let mut key = sample_catalog_key();
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "provider_type": "codex",
+                "code": "exhausted",
+                "exhausted": true,
+                "windows": [{
+                    "code": "weekly",
+                    "scope": "account",
+                    "used_ratio": 0.83,
+                    "remaining_ratio": 0.17,
+                    "reset_at": 4_102_444_800u64
+                }]
+            }
+        }));
+        let payload = provider_key_status_snapshot_payload(&key, "codex");
+        assert_eq!(payload["quota"]["code"], "ok");
+        assert_eq!(payload["quota"]["exhausted"], false);
+        assert!(payload["quota"]["label"].is_null());
+
+        // An explicit current upstream refusal is not a stale percentage summary.
+        key.status_snapshot.as_mut().unwrap()["quota"]["allowed"] = json!(false);
+        let payload = provider_key_status_snapshot_payload(&key, "codex");
+        assert_eq!(payload["quota"]["code"], "exhausted");
+        assert_eq!(payload["quota"]["exhausted"], true);
+
+        // Missing capacity evidence must not clear an exhausted summary either.
+        key.status_snapshot = Some(json!({"quota": {
+            "provider_type": "codex", "code": "exhausted", "exhausted": true
+        }}));
+        let payload = provider_key_status_snapshot_payload(&key, "codex");
+        assert_eq!(payload["quota"]["code"], "exhausted");
+        assert_eq!(payload["quota"]["exhausted"], true);
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_refreshes_codex_timestamp_formats() {
+        for updated_at in [
+            json!(1_900_000_000u64),
+            json!(1_900_000_000_000u64),
+            json!("2030-03-17T17:46:40Z"),
+        ] {
+            let mut key = sample_catalog_key();
+            key.upstream_metadata = Some(json!({
+                "codex": {
+                    "updated_at": updated_at,
+                    "primary_used_percent": 83.0,
+                    "primary_reset_at": 4_102_444_800u64
+                }
+            }));
+            key.status_snapshot = Some(json!({
+                "quota": {
+                    "provider_type": "codex",
+                    "updated_at": 1_899_999_000u64,
+                    "code": "exhausted",
+                    "exhausted": true,
+                    "allowed": false,
+                    "windows": [{
+                        "code": "weekly",
+                        "scope": "account",
+                        "used_ratio": 1.0,
+                        "remaining_ratio": 0.0,
+                        "reset_at": 4_102_444_800u64
+                    }]
+                }
+            }));
+            let payload = provider_key_status_snapshot_payload(&key, "codex");
+            assert_eq!(payload["quota"]["code"], "ok");
+            assert_eq!(payload["quota"]["updated_at"], 1_900_000_000u64);
+            assert_eq!(payload["quota"]["windows"][0]["used_ratio"], 0.83);
+            assert!(payload["quota"]["allowed"].is_null());
+        }
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_preserves_codex_account_quota_on_unrelated_updates() {
+        for patch in [
+            json!({"plan_type": "pro"}),
+            json!({"spark_primary_used_percent": 83.0}),
+            json!({"credits_unlimited": false}),
+            json!({"windows": [{"code": "weekly", "reset_at": 4_102_444_800u64}]}),
+        ] {
+            let mut metadata = patch;
+            metadata["updated_at"] = json!("2030-03-17T17:46:40Z");
+            let mut key = sample_catalog_key();
+            key.upstream_metadata = Some(json!({"codex": metadata}));
+            key.status_snapshot = Some(json!({"quota": {
+                "provider_type": "codex", "updated_at": 200,
+                "code": "exhausted", "exhausted": true, "allowed": false,
+                "windows": [{"code": "weekly", "scope": "account", "used_ratio": 1.0,
+                    "remaining_ratio": 0.0, "reset_at": 4_102_444_800u64}]
+            }}));
+            let payload = provider_key_status_snapshot_payload(&key, "codex");
+            assert_eq!(payload["quota"]["code"], "exhausted", "{metadata}");
+            assert_eq!(payload["quota"]["exhausted"], true, "{metadata}");
+            assert_eq!(payload["quota"]["allowed"], false, "{metadata}");
+            assert_eq!(payload["quota"]["updated_at"], 200, "{metadata}");
+            assert_eq!(
+                payload["quota"]["windows"][0]["code"], "weekly",
+                "{metadata}"
+            );
+            assert_eq!(
+                payload["quota"]["windows"][0]["used_ratio"], 1.0,
+                "{metadata}"
+            );
+        }
     }
 
     #[test]

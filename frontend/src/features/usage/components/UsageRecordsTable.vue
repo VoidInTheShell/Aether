@@ -149,32 +149,14 @@
             <SelectValue placeholder="状态" />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="__all__">
-              全部类型
-            </SelectItem>
-            <SelectItem value="stream">
-              HTTP 流式
-            </SelectItem>
-            <SelectItem value="standard">
-              HTTP 标准
-            </SelectItem>
-            <SelectItem value="websocket">
-              WebSocket (WS)
-            </SelectItem>
-            <SelectItem value="active">
-              活跃
-            </SelectItem>
-            <SelectItem value="failed">
-              失败
-            </SelectItem>
-            <SelectItem value="cancelled">
-              已取消
-            </SelectItem>
-            <SelectItem value="has_retry">
-              发生重试
-            </SelectItem>
-            <SelectItem value="has_fallback">
-              发生转移
+            <!-- 手机与桌面共用状态选项，避免新增筛选时漏掉手机入口。 -->
+            <SelectItem
+              v-for="option in statusFilterOptions"
+              :key="option.value"
+              :value="option.value"
+              :disabled="option.disabled"
+            >
+              {{ option.label }}
             </SelectItem>
           </SelectContent>
         </Select>
@@ -251,6 +233,13 @@
                 model-class="text-[15px] font-semibold leading-5"
                 stack-full-width
               />
+              <ShieldCheck
+                v-if="record.chat_pii_redaction"
+                data-usage-attempt-marker="pii-redaction"
+                class="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400 flex-shrink-0"
+                title="此请求触发了敏感信息保护：发送给上游的内容已替换为占位符"
+                aria-label="触发敏感信息保护"
+              />
               <!-- 状态 Badge -->
               <Badge
                 v-if="isUsageRecordFailed(record)"
@@ -311,28 +300,12 @@
               </Badge>
             </div>
           </div>
-          <div class="flex flex-col items-end flex-shrink-0">
-            <span
-              v-if="record.usage_available !== false && record.usage_pricing_available !== false"
-              class="text-sm text-primary font-semibold leading-5"
-            >{{ formatCurrency(record.cost || 0) }}</span>
-            <span
-              v-else-if="record.usage_available === false"
-              data-usage-unavailable="cost"
-              class="text-sm text-muted-foreground font-medium leading-5"
-              title="上游未提供可验证的 token/费用用量"
-            >不可用</span>
-            <span
-              v-else
-              data-usage-unpriced="cost"
-              class="text-sm text-muted-foreground font-medium leading-5"
-              title="token 用量可验证，但当前计价规则不支持该音频用量分项"
-            >未计价</span>
-            <span
-              v-if="record.usage_available !== false && record.usage_pricing_available !== false && showActualCost && record.actual_cost !== undefined && record.rate_multiplier && record.rate_multiplier !== 1.0"
-              class="text-[10px] text-muted-foreground"
-            >{{ formatCurrency(record.actual_cost) }}</span>
-          </div>
+          <UsageCostDisplay
+            :record="record"
+            :show-actual-cost="showActualCost"
+            compact
+            class="shrink-0"
+          />
         </div>
 
         <!-- 第二行：时间 + API格式 -->
@@ -349,19 +322,44 @@
           </template>
         </div>
 
-        <!-- 第三行：用户 + 提供商 -->
+        <!-- 用户与上游提供商信息 -->
         <div
           v-if="isAdmin"
-          class="mt-1 flex min-w-0 items-center gap-1.5 text-[10px] leading-3.5 text-muted-foreground"
+          class="mt-1 min-w-0 truncate text-[10px] leading-3.5 text-muted-foreground"
+          :title="formatRecordUserSegment(record)"
         >
-          <span
-            class="min-w-0 truncate"
-            :title="formatRecordUserProviderLine(record)"
-          >
-            {{ formatRecordUserSegment(record) }}
-          </span>
-          <span class="shrink-0 text-muted-foreground/40">·</span>
-          <span class="min-w-0 truncate">{{ formatRecordProviderSegment(record) }}</span>
+          {{ formatRecordUserSegment(record) }}
+        </div>
+        <div
+          v-if="isAdmin"
+          class="mt-1 flex min-w-0 items-center gap-1.5 text-[10px] leading-3.5"
+        >
+          <UsageProviderDisplay
+            :record="record"
+            class="flex-1"
+          />
+          <!-- 手机与桌面保持相同的标记优先级：发生故障转移时优先显示转移标记。 -->
+          <Shuffle
+            v-if="record.has_fallback"
+            data-usage-attempt-marker="fallback"
+            class="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 flex-shrink-0"
+            title="此请求发生了 Provider 故障转移"
+            aria-label="发生 Provider 故障转移"
+          />
+          <Ban
+            v-if="record.has_skipped_candidate && !record.has_fallback"
+            data-usage-attempt-marker="skipped-candidate"
+            class="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 flex-shrink-0"
+            :title="skippedCandidateTooltip(record)"
+            :aria-label="skippedCandidateAriaLabel(record)"
+          />
+          <RefreshCcw
+            v-if="record.has_retry"
+            data-usage-attempt-marker="retry"
+            class="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 flex-shrink-0"
+            title="此请求发生了重试"
+            aria-label="发生重试"
+          />
         </div>
 
         <!-- 第四行：性能指标 -->
@@ -760,36 +758,47 @@
             :class="[isAdmin ? 'w-[14%]' : 'w-[22%]']"
             :title="getModelTooltip(record)"
           >
-            <UsageModelDisplay
-              :record="record"
-              class="text-xs"
-            />
+            <div class="flex min-w-0 items-start gap-1">
+              <UsageModelDisplay
+                :record="record"
+                class="text-xs"
+              />
+              <ShieldCheck
+                v-if="record.chat_pii_redaction"
+                data-usage-attempt-marker="pii-redaction"
+                class="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400"
+                title="此请求触发了敏感信息保护：发送给上游的内容已替换为占位符"
+                aria-label="触发敏感信息保护"
+              />
+            </div>
           </TableCell>
           <TableCell
             v-if="isAdmin && isColumnVisible('provider')"
             class="py-4 w-[16%]"
           >
             <div class="flex min-w-0 items-center gap-1">
-              <div class="flex min-w-0 flex-col text-xs gap-0.5">
-                <span class="truncate">{{ record.provider }}</span>
-                <span
-                  v-if="record.provider_key_name"
-                  class="text-muted-foreground truncate"
-                  :title="record.provider_key_name"
-                >
-                  {{ record.provider_key_name }}
-                  <span
-                    v-if="record.rate_multiplier && record.rate_multiplier !== 1.0"
-                    class="text-foreground/60"
-                  >({{ record.rate_multiplier }}x)</span>
-                </span>
-              </div>
+              <UsageProviderDisplay
+                :record="record"
+                class="text-xs"
+              />
               <Shuffle
                 v-if="record.has_fallback"
                 data-usage-attempt-marker="fallback"
                 class="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 flex-shrink-0"
                 title="此请求发生了 Provider 故障转移"
                 aria-label="发生 Provider 故障转移"
+              />
+              <!--
+                被跳过的更高优先级候选：与"故障转移"区分开。
+                它表示候选在调度阶段就被排除、请求从未发出，因此不会有任何上游报错，
+                是"无报错却换了提供商"这一现象的直接解释。
+              -->
+              <Ban
+                v-if="record.has_skipped_candidate && !record.has_fallback"
+                data-usage-attempt-marker="skipped-candidate"
+                class="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 flex-shrink-0"
+                :title="skippedCandidateTooltip(record)"
+                :aria-label="skippedCandidateAriaLabel(record)"
               />
               <RefreshCcw
                 v-if="record.has_retry"
@@ -958,34 +967,10 @@
             v-if="isColumnVisible('cost')"
             class="text-right py-4 w-[6%]"
           >
-            <div
-              v-if="record.usage_available !== false && record.usage_pricing_available !== false"
-              class="flex flex-col items-end text-xs gap-0.5"
-            >
-              <span class="text-primary font-medium">{{ formatCurrency(record.cost || 0) }}</span>
-              <span
-                v-if="showActualCost && record.actual_cost !== undefined && record.rate_multiplier && record.rate_multiplier !== 1.0"
-                class="text-muted-foreground"
-              >
-                {{ formatCurrency(record.actual_cost) }}
-              </span>
-            </div>
-            <div
-              v-else-if="record.usage_available === false"
-              data-usage-unavailable="cost"
-              class="text-xs text-muted-foreground"
-              title="上游未提供可验证的 token/费用用量"
-            >
-              不可用
-            </div>
-            <div
-              v-else
-              data-usage-unpriced="cost"
-              class="text-xs text-muted-foreground"
-              title="token 用量可验证，但当前计价规则不支持该音频用量分项"
-            >
-              未计价
-            </div>
+            <UsageCostDisplay
+              :record="record"
+              :show-actual-cost="showActualCost"
+            />
           </TableCell>
           <TableCell
             v-if="isColumnVisible('performance')"
@@ -1093,8 +1078,8 @@ import {
   SortableTableHead,
   TableFilterMenu,
 } from '@/components/ui'
-import { EyeOff, RefreshCcw, Search, Shuffle } from 'lucide-vue-next'
-import { formatTokens, formatCurrency } from '@/utils/format'
+import { Ban, EyeOff, RefreshCcw, Search, ShieldCheck, Shuffle } from 'lucide-vue-next'
+import { formatTokens } from '@/utils/format'
 import { getCacheCreationTokens, getCacheReadTokens, getEffectiveInputTokens } from '../token-normalization'
 import {
   formatOutputRate,
@@ -1115,6 +1100,7 @@ import { useDarkMode } from '@/composables/useDarkMode'
 import { API_FORMAT_ORDER, formatApiFormat } from '@/api/endpoints/types/api-format'
 import { formatClientFamily } from '@/features/usage/utils/clientFamily'
 import { formatServiceTierFact } from '../utils/service-tier'
+import { formatCandidateSkipReason } from '../utils/skipReason'
 import { isCyberPolicyError } from '../utils/cyberError'
 import { formatUsageWebSocketTransportTitle as getWebSocketTransportTitle } from '../utils/websocketTransport'
 import type { DateRangeParams, UsageRecord } from '../types'
@@ -1123,6 +1109,8 @@ import type { MultiSelectOption } from '@/components/common/MultiSelect.vue'
 import ElapsedTimeText from './ElapsedTimeText.vue'
 import ServerUserSelector from './ServerUserSelector.vue'
 import UsageModelDisplay from './UsageModelDisplay.vue'
+import UsageCostDisplay from './UsageCostDisplay.vue'
+import UsageProviderDisplay from './UsageProviderDisplay.vue'
 
 export interface UserOption {
   id: string
@@ -1370,6 +1358,8 @@ const statusFilterOptions: FilterOption[] = [
   { value: 'cancelled', label: '已取消' },
   { value: 'has_retry', label: '发生重试' },
   { value: 'has_fallback', label: '发生转移' },
+  // 与"发生转移"区分：候选在调度阶段就被排除，请求从未发出（无上游报错）
+  { value: 'has_skipped_candidate', label: '有候选被调度跳过' },
 ]
 
 const timeRangeModel = computed({
@@ -1447,16 +1437,8 @@ function getRecordUserName(record: UsageRecord): string {
   return record.username || record.user_email || (record.user_id ? `User ${record.user_id}` : '已删除用户')
 }
 
-function formatRecordUserProviderLine(record: UsageRecord): string {
-  return `${formatRecordUserSegment(record)} · ${formatRecordProviderSegment(record)}`
-}
-
 function formatRecordUserSegment(record: UsageRecord): string {
   return `${getRecordUserName(record)} / ${record.api_key?.name || '-'}`
-}
-
-function formatRecordProviderSegment(record: UsageRecord): string {
-  return `${record.provider || '-'} / ${record.provider_key_name || '-'}`
 }
 
 watch(() => props.filterSearch, (value) => {
@@ -1602,6 +1584,23 @@ function shouldShowFormatConversion(record: UsageRecord): boolean {
   return record.api_format.trim().toLowerCase() !== record.endpoint_api_format.trim().toLowerCase()
 }
 
+// 被跳过候选的提示文案：把"调度阶段排除"和"上游失败"讲清楚，
+// 避免用户把"无报错换提供商"误判成调度 bug 或提供商静默出错。
+function skippedCandidateTooltip(record: UsageRecord): string {
+  const reasons = (record.skipped_candidate_reasons ?? [])
+    .map(formatCandidateSkipReason)
+    .filter((reason, index, all) => reason && all.indexOf(reason) === index)
+
+  const header = '本次有候选在调度阶段被跳过，请求未发往该候选（因此不会有上游报错）'
+  if (!reasons.length) return header
+  return `${header}\n跳过原因：${reasons.join('；')}`
+}
+
+function skippedCandidateAriaLabel(record: UsageRecord): string {
+  const reasons = (record.skipped_candidate_reasons ?? []).map(formatCandidateSkipReason)
+  return reasons.length ? `有候选被调度跳过：${reasons.join('；')}` : '有候选被调度跳过'
+}
+
 // 获取 API 格式的 tooltip（包含转换信息）
 function getApiFormatTooltip(record: UsageRecord): string {
   if (!record.api_format) {
@@ -1618,20 +1617,6 @@ function getApiFormatTooltip(record: UsageRecord): string {
   }
 
   return displayFormat
-}
-
-// 获取实际使用的模型（优先 target_model，其次列表接口下发的 model_version）
-// 只有当实际模型与请求模型不同时才返回，用于显示映射箭头
-function getActualModel(record: UsageRecord): string | null {
-  // 优先显示模型映射
-  if (record.target_model && record.target_model !== record.model) {
-    return record.target_model
-  }
-  // 其次显示 Provider 返回的实际版本（如 Gemini 的 modelVersion）
-  if (record.model_version && record.model_version !== record.model) {
-    return record.model_version
-  }
-  return null
 }
 
 function getReasoningEffort(record: UsageRecord): string | null {
@@ -1708,15 +1693,18 @@ function getServiceTierTitle(record: UsageRecord): string {
 
 // 获取模型列的 tooltip
 function getModelTooltip(record: UsageRecord): string {
-  const actualModel = getActualModel(record)
   const reasoningEffort = getReasoningEffort(record)
   const serviceTierTitle = getServiceTierTitle(record)
   const tierSuffix = serviceTierTitle ? `\n${serviceTierTitle}` : ''
   const cyberSuffix = hasCyberPolicyError(record) ? '\nCyber Policy: blocked' : ''
   const suffix = `${reasoningEffort ? `\nReasoning: ${reasoningEffort}` : ''}${tierSuffix}${cyberSuffix}`
-  if (actualModel) {
-    return `${record.model} -> ${actualModel}${suffix}`
-  }
-  return `${record.model}${suffix}`
+  const requestModel = record.model.trim()
+  const mappingModel = record.target_model?.trim()
+  const responseModel = record.response_model?.trim()
+  return [
+    requestModel,
+    mappingModel && mappingModel !== requestModel ? `映射模型: ${mappingModel}` : null,
+    responseModel && responseModel !== requestModel ? `响应模型: ${responseModel}` : null,
+  ].filter((line): line is string => Boolean(line)).join('\n') + suffix
 }
 </script>

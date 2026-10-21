@@ -79,6 +79,8 @@ export interface ApiFormatStatsItem {
 // 请求状态类型
 // 日期范围参数
 export interface DateRangeParams {
+  from?: string
+  to?: string
   start_date?: string
   end_date?: string
   preset?: string
@@ -100,7 +102,8 @@ export type FilterStatusValue =
   'failed' |
   'cancelled' |
   'has_fallback' |
-  'has_retry'
+  'has_retry' |
+  'has_skipped_candidate'
 
 // 默认统计状态
 export function createDefaultStats(): UsageStatsState {

@@ -1340,6 +1340,7 @@ async fn provider_query_apply_pool_scheduler_to_test_candidates(
         provider.id.clone(),
         provider_query_ai_pool_runtime_state(&runtime),
     );
+    let reserve_minimum_quota = pool_config.reserve_minimum_quota;
     let pool_config =
         provider_query_ai_pool_scheduling_config(pool_config, provider.provider_type.as_str());
     let inputs = keys
@@ -1351,6 +1352,14 @@ async fn provider_query_apply_pool_scheduler_to_test_candidates(
                 effective_model: effective_model.to_string(),
                 scheduler_skip_reason: None,
             };
+            let mut key_context =
+                provider_query_pool_catalog_key_context(state, &key, &provider.provider_type);
+            key_context.quota_exhausted |= reserve_minimum_quota
+                && admin_provider_pool_pure::admin_pool_key_minimum_quota_reached(
+                    &key,
+                    &provider.provider_type,
+                    Some(effective_model),
+                );
             AiPoolCandidateInput {
                 facts: AiPoolCandidateFacts {
                     provider_id: provider.id.clone(),
@@ -1362,11 +1371,7 @@ async fn provider_query_apply_pool_scheduler_to_test_candidates(
                     key_internal_priority: key.internal_priority,
                 },
                 pool_config: Some(pool_config.clone()),
-                key_context: provider_query_pool_catalog_key_context(
-                    state,
-                    &key,
-                    &provider.provider_type,
-                ),
+                key_context,
                 candidate,
             }
         })
@@ -3142,6 +3147,7 @@ async fn provider_query_execute_standard_test_candidate(
                         force_body_stream_field: require_body_stream_field,
                         kiro_auth_config: None,
                         is_claude_code: false,
+                        is_vertex: false,
                         enable_model_directives: false,
                     },
                 )
@@ -3457,7 +3463,7 @@ async fn provider_query_execute_standard_test_candidate(
     {
         request_headers
             .entry("user-agent".to_string())
-            .or_insert_with(|| crate::provider_transport::GEMINI_CLI_USER_AGENT.to_string());
+            .or_insert_with(aether_provider_transport::gemini_cli::gemini_cli_client_user_agent);
     }
     let protected_headers = if uses_vertex_query_auth {
         vec!["content-type"]

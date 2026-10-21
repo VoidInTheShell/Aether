@@ -84,6 +84,8 @@ jobs:
     needs: source
     if: ${{ needs.source.outputs.skip != 'true' }}
     uses: ./.github/workflows/rust-ci.yml
+    with:
+      full_scope: true
 
   rust_extended:
     name: Rust extended checks

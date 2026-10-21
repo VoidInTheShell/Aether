@@ -1,9 +1,10 @@
 use super::{
     read_decision_trace, read_provider_transport_snapshot, read_request_candidate_trace,
-    AdjustWalletBalanceInput, AdminBillingCollectorRecord, AdminBillingCollectorWriteInput,
-    AdminBillingMutationOutcome, AdminBillingPresetApplyResult, AdminBillingRuleRecord,
-    AdminBillingRuleWriteInput, AdminPaymentOrderListQuery, AdminRedeemCodeBatchListQuery,
-    AdminRedeemCodeListQuery, AdminWalletLedgerQuery, AdminWalletListQuery,
+    AdjustWalletBalanceInBatchInput, AdjustWalletBalanceInput, AdminBillingCollectorRecord,
+    AdminBillingCollectorWriteInput, AdminBillingMutationOutcome, AdminBillingPresetApplyResult,
+    AdminBillingRuleRecord, AdminBillingRuleWriteInput, AdminPaymentOrderListQuery,
+    AdminRedeemCodeBatchListQuery, AdminRedeemCodeListQuery,
+    AdminUserWalletBalanceBatchUserOutcome, AdminWalletLedgerQuery, AdminWalletListQuery,
     AdminWalletRefundRequestListQuery, AnnouncementListQuery, AuditLogListQuery,
     BackgroundTaskListQuery, BackgroundTaskSummary, BillingModelContextCacheKey,
     BillingModelContextCacheState, BillingModelContextInflightState, BillingPlanRecord,
@@ -17,29 +18,33 @@ use super::{
     DisableAdminRedeemCodeBatchInput, DisableAdminRedeemCodeInput, FailAdminWalletRefundInput,
     FailWalletRechargeCheckoutInput, GatewayDataState, GatewayProviderTransportSnapshot,
     LocalVideoTaskReadResponse, PaymentGatewayConfigCasWriteInput, PaymentGatewayConfigRecord,
-    PaymentGatewayConfigWriteInput, PaymentGatewaySecretCasUpdate, ProcessAdminWalletRefundInput,
-    ProcessPaymentCallbackInput, ProcessPaymentCallbackOutcome, ReclaimWalletRechargeCheckoutInput,
-    ReconcileUsagePolicyCostInput, RedeemWalletCodeInput, RedeemWalletCodeOutcome,
-    ReleaseUsagePolicyRequestAdmissionInput, RequestAuditBundle, RequestCandidateTrace,
-    ReserveUsagePolicyCostInput, ReserveUsagePolicyCostOutcome, ReserveUsagePolicyRequestInput,
-    ReserveUsagePolicyRequestOutcome, StoredAdminAuditLogPage, StoredAdminPaymentCallbackPage,
-    StoredAdminPaymentOrder, StoredAdminPaymentOrderPage, StoredAdminRedeemCodeBatch,
-    StoredAdminRedeemCodeBatchPage, StoredAdminRedeemCodePage, StoredAdminWalletLedgerPage,
-    StoredAdminWalletListPage, StoredAdminWalletRefund, StoredAdminWalletRefundPage,
-    StoredAdminWalletRefundRequestPage, StoredAdminWalletTransaction,
-    StoredAdminWalletTransactionPage, StoredAnnouncement, StoredAnnouncementPage,
-    StoredBackgroundTaskEvent, StoredBackgroundTaskRun, StoredBackgroundTaskRunPage,
-    StoredBillingModelContext, StoredProviderQuotaSnapshot, StoredProviderUsageSummary,
-    StoredRequestUsageAudit, StoredSuspiciousActivity, StoredUsagePolicyCostReservation,
-    StoredUsagePolicyRequestAdmission, StoredUsageSettlement, StoredUserAuditLogPage,
-    StoredUserAuthRecord, StoredUserExportRow, StoredUserSummary, StoredVideoTask,
-    StoredWalletDailyUsageLedger, StoredWalletDailyUsageLedgerPage, StoredWalletSnapshot,
-    UpdateAdminWalletRefundGatewayInput, UpdateAnnouncementRecord,
+    PaymentGatewayConfigWriteInput, PaymentGatewaySecretCasUpdate,
+    PrepareAdminUserWalletBalanceBatchInput, PrepareAdminUserWalletBalanceBatchOutcome,
+    ProcessAdminWalletRefundInput, ProcessPaymentCallbackInput, ProcessPaymentCallbackOutcome,
+    ReclaimWalletRechargeCheckoutInput, ReconcileUsagePolicyCostInput, RedeemWalletCodeInput,
+    RedeemWalletCodeOutcome, ReleaseUsagePolicyRequestAdmissionInput, RequestAuditBundle,
+    RequestCandidateTrace, ReserveUsagePolicyCostInput, ReserveUsagePolicyCostOutcome,
+    ReserveUsagePolicyRequestInput, ReserveUsagePolicyRequestOutcome, StoredAdminAuditLogPage,
+    StoredAdminPaymentCallbackPage, StoredAdminPaymentOrder, StoredAdminPaymentOrderPage,
+    StoredAdminRedeemCodeBatch, StoredAdminRedeemCodeBatchPage, StoredAdminRedeemCodePage,
+    StoredAdminUserWalletBalanceBatch, StoredAdminWalletLedgerPage, StoredAdminWalletListPage,
+    StoredAdminWalletRefund, StoredAdminWalletRefundPage, StoredAdminWalletRefundRequestPage,
+    StoredAdminWalletTransaction, StoredAdminWalletTransactionPage, StoredAnnouncement,
+    StoredAnnouncementPage, StoredBackgroundTaskEvent, StoredBackgroundTaskRun,
+    StoredBackgroundTaskRunPage, StoredBillingModelContext, StoredProviderQuotaSnapshot,
+    StoredProviderUsageSummary, StoredRequestUsageAudit, StoredSuspiciousActivity,
+    StoredUsagePolicyCostReservation, StoredUsagePolicyRequestAdmission, StoredUsageSettlement,
+    StoredUserAuditLogPage, StoredUserAuthRecord, StoredUserExportRow, StoredUserSummary,
+    StoredVideoTask, StoredWalletDailyUsageLedger, StoredWalletDailyUsageLedgerPage,
+    StoredWalletSnapshot, UpdateAdminWalletRefundGatewayInput, UpdateAnnouncementRecord,
     UpdateWalletRechargeCheckoutInput, UpsertBackgroundTaskEvent, UpsertBackgroundTaskRun,
     UpsertUsageRecord, UpsertVideoTask, UsageSettlementInput, UserDailyQuotaAvailabilityRecord,
     UserPlanEntitlementRecord, VideoTaskLookupKey, VideoTaskModelCount, VideoTaskQueryFilter,
     VideoTaskStatusCount, WalletDailyUsageAggregationInput, WalletDailyUsageAggregationResult,
     WalletLookupKey, WalletMutationOutcome,
+};
+use aether_data_contracts::repository::billing::{
+    ProviderExpenseInput, ProviderExpensePage, ProviderExpenseQuery, ProviderExpenseRecord,
 };
 use aether_data_contracts::repository::usage::{
     PendingUsageCleanupSummary, ProviderApiKeyWindowUsageRequest,
@@ -364,6 +369,26 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn rebuild_overview_buckets(
+        &self,
+        input: &aether_data::StatsHourlyAggregationInput,
+    ) -> Result<usize, DataLayerError> {
+        match &self.backends {
+            Some(backends) => backends.rebuild_overview_buckets(input).await,
+            None => Ok(0),
+        }
+    }
+
+    pub(crate) async fn drain_overview_dirty_events(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, DataLayerError> {
+        match &self.backends {
+            Some(backends) => backends.drain_overview_dirty_events(now).await,
+            None => Ok(0),
+        }
+    }
+
     pub(crate) async fn aggregate_stats_daily(
         &self,
         input: &aether_data::StatsDailyAggregationInput,
@@ -381,6 +406,18 @@ impl GatewayDataState {
         match &self.announcement_reader {
             Some(repository) => repository.list_announcements(query).await,
             None => Ok(StoredAnnouncementPage::default()),
+        }
+    }
+
+    pub(crate) async fn list_user_announcements(
+        &self,
+        user_id: &str,
+        query: &aether_data::repository::announcements::UserAnnouncementListQuery,
+    ) -> Result<aether_data::repository::announcements::StoredUserAnnouncementPage, DataLayerError>
+    {
+        match &self.announcement_reader {
+            Some(repository) => repository.list_user_announcements(user_id, query).await,
+            None => Ok(Default::default()),
         }
     }
 
@@ -753,6 +790,21 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn find_admin_wallet_transaction(
+        &self,
+        wallet_id: &str,
+        transaction_id: &str,
+    ) -> Result<Option<StoredAdminWalletTransaction>, DataLayerError> {
+        match &self.wallet_reader {
+            Some(repository) => {
+                repository
+                    .find_admin_wallet_transaction(wallet_id, transaction_id)
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
     pub(crate) async fn list_admin_wallet_transactions(
         &self,
         wallet_id: &str,
@@ -1066,9 +1118,77 @@ impl GatewayDataState {
     pub(crate) async fn adjust_wallet_balance(
         &self,
         input: AdjustWalletBalanceInput,
-    ) -> Result<Option<(StoredWalletSnapshot, StoredAdminWalletTransaction)>, DataLayerError> {
+    ) -> Result<Option<(StoredWalletSnapshot, Option<StoredAdminWalletTransaction>)>, DataLayerError>
+    {
         match &self.wallet_writer {
             Some(repository) => repository.adjust_wallet_balance(input).await,
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn prepare_admin_user_wallet_balance_batch(
+        &self,
+        input: PrepareAdminUserWalletBalanceBatchInput,
+    ) -> Result<Option<PrepareAdminUserWalletBalanceBatchOutcome>, DataLayerError> {
+        match &self.wallet_writer {
+            Some(repository) => repository
+                .prepare_admin_user_wallet_balance_batch(input)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn get_admin_user_wallet_balance_batch(
+        &self,
+        admin_user_id: &str,
+        idempotency_key: &str,
+        request_fingerprint: &str,
+    ) -> Result<Option<PrepareAdminUserWalletBalanceBatchOutcome>, DataLayerError> {
+        match &self.wallet_writer {
+            Some(repository) => {
+                repository
+                    .get_admin_user_wallet_balance_batch(
+                        admin_user_id,
+                        idempotency_key,
+                        request_fingerprint,
+                    )
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn adjust_admin_user_wallet_balance_batch_user(
+        &self,
+        input: AdjustWalletBalanceInBatchInput,
+    ) -> Result<Option<AdminUserWalletBalanceBatchUserOutcome>, DataLayerError> {
+        match &self.wallet_writer {
+            Some(repository) => repository
+                .adjust_admin_user_wallet_balance_batch_user(input)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn record_admin_user_wallet_balance_batch_failure(
+        &self,
+        admin_user_id: &str,
+        idempotency_key: &str,
+        user_id: &str,
+        reason: &str,
+    ) -> Result<Option<AdminUserWalletBalanceBatchUserOutcome>, DataLayerError> {
+        match &self.wallet_writer {
+            Some(repository) => repository
+                .record_admin_user_wallet_balance_batch_failure(
+                    admin_user_id,
+                    idempotency_key,
+                    user_id,
+                    reason,
+                )
+                .await
+                .map(Some),
             None => Ok(None),
         }
     }
@@ -1659,6 +1779,60 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn query_dashboard_summary(
+        &self,
+        query: &aether_data_contracts::repository::usage::UsageDashboardAnalyticsQuery,
+    ) -> Result<aether_data_contracts::repository::usage::StoredDashboardSummary, DataLayerError>
+    {
+        match &self.usage_reader {
+            Some(repository) => repository.query_dashboard_summary(query).await,
+            None => Err(DataLayerError::InvalidInput(
+                "dashboard summary repository is unavailable".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn query_dashboard_analytics(
+        &self,
+        query: &aether_data_contracts::repository::usage::UsageDashboardAnalyticsQuery,
+    ) -> Result<
+        aether_data_contracts::repository::usage::StoredUsageDashboardAnalytics,
+        DataLayerError,
+    > {
+        match &self.usage_reader {
+            Some(repository) => repository.query_dashboard_analytics(query).await,
+            None => Err(DataLayerError::InvalidInput(
+                "usage analytics repository is unavailable".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn query_usage_analytics(
+        &self,
+        query: &aether_data_contracts::repository::usage::UsageAnalyticsQuery,
+    ) -> Result<aether_data_contracts::repository::usage::StoredUsageAnalytics, DataLayerError>
+    {
+        match &self.usage_reader {
+            Some(repository) => repository.query_usage_analytics(query).await,
+            None => Err(DataLayerError::InvalidInput(
+                "usage analytics repository is unavailable".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn summarize_health_observations(
+        &self,
+        query: &aether_data_contracts::repository::usage::HealthObservationQuery,
+    ) -> Result<aether_data_contracts::repository::usage::HealthObservationSummary, DataLayerError>
+    {
+        match &self.usage_reader {
+            Some(repository) => repository.summarize_health_observations(query).await,
+            None => Err(DataLayerError::InvalidInput(
+                "health observations repository is unavailable".into(),
+            )),
+        }
+    }
+
     pub(crate) async fn summarize_usage_audits(
         &self,
         query: &aether_data_contracts::repository::usage::UsageAuditSummaryQuery,
@@ -1827,6 +2001,21 @@ impl GatewayDataState {
     > {
         match &self.usage_reader {
             Some(repository) => repository.summarize_usage_breakdown(query).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// 健康监控时间线条：数据库侧全窗口分桶聚合。
+    /// 仓储不可用时返回空结果，调用方降级为"无请求"时间线而不是报错。
+    pub(crate) async fn aggregate_usage_health_timeline(
+        &self,
+        query: &aether_data_contracts::repository::usage::UsageHealthTimelineQuery,
+    ) -> Result<
+        Vec<aether_data_contracts::repository::usage::StoredUsageHealthTimelineRow>,
+        DataLayerError,
+    > {
+        match &self.usage_reader {
+            Some(repository) => repository.aggregate_usage_health_timeline(query).await,
             None => Ok(Vec::new()),
         }
     }
@@ -2747,6 +2936,35 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn list_provider_expenses(
+        &self,
+        query: &ProviderExpenseQuery,
+    ) -> Result<Option<ProviderExpensePage>, DataLayerError> {
+        match &self.billing_reader {
+            Some(repo) => repo.list_provider_expenses(query).await,
+            None => Ok(None),
+        }
+    }
+    pub(crate) async fn create_provider_expense(
+        &self,
+        input: &ProviderExpenseInput,
+    ) -> Result<AdminBillingMutationOutcome<ProviderExpenseRecord>, DataLayerError> {
+        match &self.billing_reader {
+            Some(repo) => repo.create_provider_expense(input).await,
+            None => Ok(AdminBillingMutationOutcome::Unavailable),
+        }
+    }
+    pub(crate) async fn void_provider_expense(
+        &self,
+        id: &str,
+        operator: Option<&str>,
+    ) -> Result<AdminBillingMutationOutcome<ProviderExpenseRecord>, DataLayerError> {
+        match &self.billing_reader {
+            Some(repo) => repo.void_provider_expense(id, operator).await,
+            None => Ok(AdminBillingMutationOutcome::Unavailable),
+        }
+    }
+
     pub(crate) async fn list_billing_plans(
         &self,
         include_disabled: bool,
@@ -2815,6 +3033,21 @@ impl GatewayDataState {
     ) -> Result<Option<Vec<UserPlanEntitlementRecord>>, DataLayerError> {
         match &self.billing_reader {
             Some(repository) => repository.list_user_plan_entitlements(user_id).await,
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn list_user_plan_entitlements_with_history(
+        &self,
+        user_id: &str,
+        include_inactive: bool,
+    ) -> Result<Option<Vec<UserPlanEntitlementRecord>>, DataLayerError> {
+        match &self.billing_reader {
+            Some(repository) => {
+                repository
+                    .list_user_plan_entitlements_with_history(user_id, include_inactive)
+                    .await
+            }
             None => Ok(None),
         }
     }

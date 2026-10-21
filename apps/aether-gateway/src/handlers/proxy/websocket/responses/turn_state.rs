@@ -22,6 +22,11 @@ use crate::plan_usage_policy::PlanUsagePolicySnapshot;
 #[derive(Debug)]
 pub(super) struct LogicalTurn {
     pub(super) client_event: Value,
+    /// 这一轮的 `client_event` 是否实际命中过 PII 脱敏。
+    ///
+    /// 透明重试（配额换 key）会重建 planning parts 并重放同一份事件，
+    /// 事实必须留在 logical turn 上，否则重试产生的记录会漏标。
+    pub(super) client_event_pii_redacted: bool,
     /// Effective `store` after provider body rules and WebSocket framing. Only
     /// an explicit provider-side `true` permits cross-connection registry
     /// state; false or absent remains ZDR/connection-local.
@@ -52,6 +57,7 @@ impl LogicalTurn {
     pub(super) fn new(client_event: Value, turn_index: u64, logical_turn_id: String) -> Self {
         Self {
             client_event,
+            client_event_pii_redacted: false,
             provider_store: false,
             turn_index,
             logical_turn_id,
@@ -96,6 +102,11 @@ impl LogicalTurn {
 
     pub(super) fn with_provider_store(mut self, provider_store: bool) -> Self {
         self.provider_store = provider_store;
+        self
+    }
+
+    pub(super) fn with_client_event_pii_redacted(mut self, redacted: bool) -> Self {
+        self.client_event_pii_redacted = redacted;
         self
     }
 
@@ -258,6 +269,52 @@ mod tests {
             7,
             "logical-turn".to_string(),
         )
+    }
+
+    #[test]
+    fn concurrency_activity_survives_retry_and_ends_with_the_logical_turn() {
+        let activity = std::sync::Arc::new(crate::request_activity::RequestActivity::default());
+        let first = logical().with_turn_control(super::ResponsesWebSocketTurnControl {
+            decision: crate::control::GatewayControlDecision::synthetic(
+                "/v1/responses",
+                Some("ai_public".into()),
+                None,
+                None,
+                None,
+            ),
+            auth_snapshot: None,
+            rpm_bypassed: false,
+            activity: std::sync::Arc::new(activity.begin()),
+        });
+        let mut state = ResponsesTurnState::Idle;
+        state.begin(first, FakeAttempt(1));
+        assert_eq!(activity.active(), 1);
+        assert_eq!(state.detach_attempt(), Some(FakeAttempt(1)));
+        assert_eq!(
+            activity.active(),
+            1,
+            "transparent retry retains one logical request"
+        );
+        state.resume(FakeAttempt(2)).unwrap();
+        assert_eq!(activity.active(), 1);
+        assert_eq!(state.end(), Some(FakeAttempt(2)));
+        assert_eq!(activity.active(), 0);
+
+        let logical = logical().with_turn_control(super::ResponsesWebSocketTurnControl {
+            decision: crate::control::GatewayControlDecision::synthetic(
+                "/v1/responses",
+                Some("ai_public".into()),
+                None,
+                None,
+                None,
+            ),
+            auth_snapshot: None,
+            rpm_bypassed: false,
+            activity: std::sync::Arc::new(activity.begin()),
+        });
+        state.begin(logical, FakeAttempt(3));
+        drop(state);
+        assert_eq!(activity.active(), 0, "disconnect drops the logical request");
     }
 
     /// 透明重试失败之后：旧 attempt 已经被 detach 并结算过，logical turn 仍停在

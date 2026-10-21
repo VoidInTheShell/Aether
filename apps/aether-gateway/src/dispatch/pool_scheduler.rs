@@ -131,8 +131,13 @@ async fn schedule_pool_page_candidates(
         entry.1.insert(candidate.candidate.key_id.clone());
     }
 
-    let key_context_by_id =
-        read_pool_catalog_key_contexts_by_id(state, &candidates, provider_model_name).await;
+    let key_context_by_id = read_pool_catalog_key_contexts_by_id(
+        state,
+        &candidates,
+        provider_model_name,
+        effective_pool_config,
+    )
+    .await;
 
     let mut runtime_by_provider = BTreeMap::new();
     let mut pool_config_by_provider = BTreeMap::new();
@@ -321,7 +326,9 @@ fn active_probe_member_is_unschedulable_for_request(
         return true;
     }
     key_context.is_some_and(|context| {
-        context.account_blocked || context.quota_exhausted || context.quota_hard_blocked
+        context.account_blocked
+            || (pool_config.skip_exhausted_accounts && context.quota_exhausted)
+            || context.quota_hard_blocked
     })
 }
 
@@ -1029,6 +1036,26 @@ impl<'a> PoolKeyCursor<'a> {
             return None;
         }
 
+        if pool_config.reserve_minimum_quota
+            && admin_provider_pool_pure::admin_pool_key_minimum_quota_reached(
+                &key,
+                self.group.candidate.provider_type.as_str(),
+                Some(self.group.candidate.selected_provider_model_name.as_str()),
+            )
+        {
+            self.seen_key_ids.insert(key.id.clone());
+            self.record_skip_reason(POOL_ACCOUNT_EXHAUSTED_SKIP_REASON);
+            self.skipped_candidates
+                .push(SkippedLocalExecutionCandidate {
+                    candidate: pool_candidate_from_catalog_key(&self.group, key),
+                    skip_reason: POOL_ACCOUNT_EXHAUSTED_SKIP_REASON,
+                    transport: None,
+                    ranking: self.group.ranking.clone(),
+                    extra_data: None,
+                });
+            return None;
+        }
+
         let candidate = pool_candidate_from_catalog_key(&self.group, key);
         self.build_eligible_candidate(candidate).await
     }
@@ -1429,15 +1456,23 @@ async fn read_pool_catalog_key_contexts_by_id(
     state: PlannerAppState<'_>,
     candidates: &[EligibleLocalExecutionCandidate],
     provider_model_name: Option<&str>,
+    effective_pool_config: Option<&AdminProviderPoolConfig>,
 ) -> BTreeMap<String, PoolCatalogKeyContext> {
     let mut key_ids = Vec::new();
     let mut provider_type_by_key_id = BTreeMap::<String, String>::new();
+    let mut reserve_minimum_quota_key_ids = BTreeSet::new();
 
     for candidate in candidates {
-        if pool_config_for_candidate(candidate).is_none() {
+        let Some(pool_config) = effective_pool_config
+            .cloned()
+            .or_else(|| pool_config_for_candidate(candidate))
+        else {
             continue;
-        }
+        };
         let key_id = candidate.candidate.key_id.clone();
+        if pool_config.reserve_minimum_quota {
+            reserve_minimum_quota_key_ids.insert(key_id.clone());
+        }
         if let Entry::Vacant(entry) = provider_type_by_key_id.entry(key_id.clone()) {
             entry.insert(candidate.transport.provider.provider_type.clone());
             key_ids.push(key_id);
@@ -1489,16 +1524,22 @@ async fn read_pool_catalog_key_contexts_by_id(
                 .get(&key.id)
                 .map(String::as_str)
                 .unwrap_or_default();
-            (
-                key.id.clone(),
-                build_pool_catalog_key_context(
-                    state,
-                    &provider_pool_service,
+            let mut context = build_pool_catalog_key_context(
+                state,
+                &provider_pool_service,
+                &key,
+                provider_type,
+                provider_model_name,
+            );
+            let reserve_reached = reserve_minimum_quota_key_ids.contains(&key.id)
+                && admin_provider_pool_pure::admin_pool_key_minimum_quota_reached(
                     &key,
                     provider_type,
                     provider_model_name,
-                ),
-            )
+                );
+            context.quota_exhausted |= reserve_reached;
+            context.quota_hard_blocked |= reserve_reached;
+            (key.id.clone(), context)
         })
         .collect::<BTreeMap<_, _>>();
     // A key can disappear between the candidate-row and catalog reads. Keep
@@ -2264,6 +2305,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["key-older", "key-recent"]
         );
+    }
+
+    #[test]
+    fn pool_scheduler_allows_quota_exhausted_key_when_ignored() {
+        let exhausted = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-exhausted",
+            10,
+            Some(json!({ "pool_advanced": { "ignore_exhausted_accounts": true } })),
+        );
+        let contexts = BTreeMap::from([(
+            "key-exhausted".to_string(),
+            PoolCatalogKeyContext {
+                quota_exhausted: true,
+                ..PoolCatalogKeyContext::default()
+            },
+        )]);
+        let (scheduled, skipped) = apply_local_execution_pool_scheduler_with_runtime_map(
+            vec![exhausted],
+            &BTreeMap::new(),
+            &contexts,
+        );
+        assert_eq!(scheduled.len(), 1);
+        assert!(skipped.is_empty());
     }
 
     #[test]
@@ -3965,6 +4031,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_key_cursor_reserve_minimum_quota_filters_pages_and_sticky_hits() {
+        for reserve_enabled in [false, true] {
+            for sticky in [false, true] {
+                for used_percent in [99.0, 98.0, 83.0] {
+                    let provider_config = Some(json!({
+                        "pool_advanced": {
+                            "reserve_minimum_quota": reserve_enabled,
+                            "skip_exhausted_accounts": false
+                        }
+                    }));
+                    let provider =
+                        sample_codex_pool_provider("provider-pool", 0, provider_config.clone());
+                    let endpoint = sample_codex_pool_endpoint("provider-pool", "endpoint-1");
+                    let mut reserved = sample_codex_pool_key("provider-pool", "key-low");
+                    reserved.status_snapshot = Some(json!({
+                        "quota": {
+                            "provider_type": "codex",
+                            "updated_at": 100,
+                            "allowed": false,
+                            "exhausted": true,
+                            "code": "exhausted",
+                            "windows": [{
+                                "code": "weekly",
+                                "scope": "account",
+                                "used_ratio": 1.0,
+                                "reset_at": 4_102_444_800u64
+                            }]
+                        }
+                    }));
+                    reserved.upstream_metadata = Some(json!({
+                        "codex": {
+                            "updated_at": 200,
+                            "primary_used_percent": used_percent,
+                            "primary_reset_at": 4_102_444_800u64
+                        }
+                    }));
+                    let ready = sample_codex_pool_key("provider-pool", "key-ready");
+                    let rows = vec![
+                        sample_codex_pool_row("provider-pool", "endpoint-1", "key-low", 0),
+                        sample_codex_pool_row("provider-pool", "endpoint-1", "key-ready", 0),
+                    ];
+                    let data_state = GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                        Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                            vec![provider], vec![endpoint], vec![reserved, ready],
+                        )),
+                        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+                    )
+                    .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+                    let app = AppState::new()
+                        .expect("state should build")
+                        .with_data_state_for_tests(data_state);
+                    let group =
+                        sample_codex_pool_group("provider-pool", "endpoint-1", 0, provider_config);
+                    let pool_config =
+                        pool_config_for_candidate(&group).expect("pool config should parse");
+                    let sticky_token = sticky.then_some("reserve-session");
+                    if sticky {
+                        record_admin_provider_pool_success(
+                            app.runtime_state.as_ref(),
+                            "provider-pool",
+                            "key-low",
+                            &pool_config,
+                            sticky_token,
+                            0,
+                            None,
+                        )
+                        .await;
+                    }
+                    let mut cursor = PoolKeyCursor::new(
+                        PlannerAppState::new(&app),
+                        group,
+                        sticky_token,
+                        None,
+                        None,
+                    );
+                    cursor.window_size = 1;
+                    cursor.page_size = 1;
+                    let mut returned = Vec::new();
+                    while let Some(candidate) = cursor.next_key().await {
+                        returned.push(candidate.candidate.key_id);
+                    }
+                    let reserve_reached = reserve_enabled && used_percent >= 99.0;
+                    assert_eq!(
+                        returned.contains(&"key-low".to_string()),
+                        !reserve_reached,
+                        "reserve={reserve_enabled}, sticky={sticky}, used={used_percent}"
+                    );
+                    assert!(returned.contains(&"key-ready".to_string()));
+                    if reserve_reached {
+                        assert_eq!(
+                            cursor
+                                .skip_reason_counts
+                                .get(POOL_ACCOUNT_EXHAUSTED_SKIP_REASON),
+                            Some(&1)
+                        );
+                    } else if sticky {
+                        assert_eq!(returned.first().map(String::as_str), Some("key-low"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn pool_key_cursor_does_not_spend_effective_scan_budget_on_exhausted_accounts() {
         let provider_config = Some(json!({
             "pool_advanced": {
@@ -5024,15 +5194,6 @@ mod tests {
             ))
     }
 
-    fn provider_catalog_credential_state() -> AppState {
-        AppState::new()
-            .expect("credential state should build")
-            .with_data_state_for_tests(
-                GatewayDataState::disabled()
-                    .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY),
-            )
-    }
-
     fn large_pool_fixture(
         key_count: usize,
         provider_config: Option<serde_json::Value>,
@@ -5083,18 +5244,12 @@ mod tests {
         )
         .expect("endpoint transport should build");
 
-        let credential_state = provider_catalog_credential_state();
+        // 这些用例只验证池扫描、跳过计数和游标预算，不会发起请求或读取凭据。
+        // 留空凭据可跳过无关的 Fernet 加解密，同时避免复用绑定密文破坏 key_id AAD。
         let mut keys = Vec::with_capacity(key_count);
         let mut rows = Vec::with_capacity(key_count);
         for index in 0..key_count {
             let key_id = format!("key-{index:05}");
-            let encrypted_api_key = credential_state
-                .seal_provider_catalog_key_api_key(
-                    "provider-pool",
-                    &key_id,
-                    &format!("secret-{index}"),
-                )
-                .expect("api key should encrypt");
             let mut key = StoredProviderCatalogKey::new(
                 key_id.clone(),
                 "provider-pool".to_string(),
@@ -5106,7 +5261,7 @@ mod tests {
             .expect("key should build")
             .with_transport_fields(
                 Some(json!(["openai:chat"])),
-                encrypted_api_key,
+                None,
                 None,
                 None,
                 None,
@@ -5241,10 +5396,8 @@ mod tests {
         .expect("endpoint transport should build")
     }
 
+    /// 这些测试只检查池调度状态，不涉及凭据解密，因此不构造无关的密文。
     fn sample_codex_pool_key(provider_id: &str, key_id: &str) -> StoredProviderCatalogKey {
-        let encrypted_api_key = provider_catalog_credential_state()
-            .seal_provider_catalog_key_api_key(provider_id, key_id, &format!("secret-{key_id}"))
-            .expect("api key should encrypt");
         let mut key = StoredProviderCatalogKey::new(
             key_id.to_string(),
             provider_id.to_string(),
@@ -5256,7 +5409,7 @@ mod tests {
         .expect("key should build")
         .with_transport_fields(
             Some(json!(["openai:responses"])),
-            encrypted_api_key,
+            None,
             None,
             None,
             Some(json!({"openai:responses": 1})),
@@ -5400,6 +5553,8 @@ mod tests {
         key_ids: [&str; N],
     ) -> ResolvedRoutingPolicy {
         ResolvedRoutingPolicy {
+            billing_multiplier: 1.0,
+            group_name: None,
             group_id: Some("routing-group-1".to_string()),
             group_version: Some(1),
             selection_source: "test".to_string(),

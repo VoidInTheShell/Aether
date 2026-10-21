@@ -27,6 +27,12 @@
         </span>
       </div>
     </div>
+    <p
+      v-if="truncatedHint"
+      class="text-[11px] text-muted-foreground mb-2"
+    >
+      {{ truncatedHint }}
+    </p>
     <div
       v-if="loading"
       class="h-[160px] flex items-center justify-center"
@@ -68,9 +74,11 @@ const props = withDefaults(defineProps<{
   isAdmin: boolean
   hours?: number
   refreshIntervalMs?: number
+  data?: IntervalTimelineResponse | null
 }>(), {
   hours: 24,  // 默认当天
-  refreshIntervalMs: 30000
+  refreshIntervalMs: 30000,
+  data: undefined,
 })
 
 const loading = ref(false)
@@ -119,6 +127,15 @@ const COLORS = [
 const hasData = computed(() =>
   timelineData.value && timelineData.value.points && timelineData.value.points.length > 0
 )
+
+// 窗口内数据量超过展示预算时后端会均匀抽样，提示用户避免误读为完整数据
+const truncatedHint = computed(() => {
+  const data = timelineData.value
+  if (!data?.points?.length) return ''
+  const total = data.total_points || data.points.length
+  if (total <= data.points.length) return ''
+  return `窗口内共 ${total.toLocaleString()} 个间隔点，已均匀抽样展示 ${data.points.length.toLocaleString()} 个`
+})
 
 // 判断是否有多个分组（管理员按用户分组，普通用户按模型分组）
 const hasMultipleGroups = computed(() => {
@@ -292,6 +309,11 @@ const chartOptions = computed<ChartOptions<'scatter'>>(() => ({
 
 async function loadData() {
   const requestId = ++loadRequestId
+  if (props.data !== undefined) {
+    timelineData.value = props.data
+    loading.value = false
+    return
+  }
   loading.value = true
   try {
     const limit = props.isAdmin ? ADMIN_TIMELINE_LIMIT : USER_TIMELINE_LIMIT
@@ -332,6 +354,7 @@ function stopRefreshTimer() {
 }
 
 function scheduleNextRefresh() {
+  if (props.data !== undefined) return
   if (refreshTimer) return
   if (!isPageVisible.value) return
   if (!props.refreshIntervalMs || props.refreshIntervalMs <= 0) return
@@ -355,7 +378,7 @@ function handleVisibilityChange() {
   scheduleNextRefresh()
 }
 
-watch([() => props.hours, () => props.isAdmin], () => {
+watch([() => props.hours, () => props.isAdmin, () => props.data], () => {
   void loadData()
   stopRefreshTimer()
   scheduleNextRefresh()

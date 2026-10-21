@@ -62,8 +62,9 @@ pub(crate) use aether_data::repository::users::{
     StoredUserPreferenceRecord, StoredUserSessionRecord,
 };
 use aether_data::repository::wallet::{
-    AdjustWalletBalanceInput, AdminPaymentOrderListQuery, AdminRedeemCodeBatchListQuery,
-    AdminRedeemCodeListQuery, AdminWalletLedgerQuery, AdminWalletListQuery,
+    AdjustWalletBalanceInBatchInput, AdjustWalletBalanceInput, AdminPaymentOrderListQuery,
+    AdminRedeemCodeBatchListQuery, AdminRedeemCodeListQuery,
+    AdminUserWalletBalanceBatchUserOutcome, AdminWalletLedgerQuery, AdminWalletListQuery,
     AdminWalletRefundRequestListQuery, CompareAndSwapPaymentOrderStripeClientSecretInput,
     CompleteAdminWalletRefundInput, CreateAdminRedeemCodeBatchInput,
     CreateAdminRedeemCodeBatchResult, CreateManualWalletRechargeInput,
@@ -72,13 +73,14 @@ use aether_data::repository::wallet::{
     CreateWalletRefundRequestOutcome, CreditAdminPaymentOrderInput,
     DeleteAdminRedeemCodeBatchInput, DisableAdminRedeemCodeBatchInput, DisableAdminRedeemCodeInput,
     FailAdminWalletRefundInput, FailWalletRechargeCheckoutInput, InitializeAuthWalletOutcome,
+    PrepareAdminUserWalletBalanceBatchInput, PrepareAdminUserWalletBalanceBatchOutcome,
     ProcessAdminWalletRefundInput, ProcessPaymentCallbackInput, ProcessPaymentCallbackOutcome,
     ReclaimWalletRechargeCheckoutInput, RedeemWalletCodeInput, RedeemWalletCodeOutcome,
     StoredAdminPaymentCallback, StoredAdminPaymentCallbackPage, StoredAdminPaymentOrder,
     StoredAdminPaymentOrderPage, StoredAdminRedeemCode, StoredAdminRedeemCodeBatch,
-    StoredAdminRedeemCodeBatchPage, StoredAdminRedeemCodePage, StoredAdminWalletLedgerPage,
-    StoredAdminWalletListPage, StoredAdminWalletRefund, StoredAdminWalletRefundPage,
-    StoredAdminWalletRefundRequestPage, StoredAdminWalletTransaction,
+    StoredAdminRedeemCodeBatchPage, StoredAdminRedeemCodePage, StoredAdminUserWalletBalanceBatch,
+    StoredAdminWalletLedgerPage, StoredAdminWalletListPage, StoredAdminWalletRefund,
+    StoredAdminWalletRefundPage, StoredAdminWalletRefundRequestPage, StoredAdminWalletTransaction,
     StoredAdminWalletTransactionPage, StoredWalletDailyUsageLedger,
     StoredWalletDailyUsageLedgerPage, StoredWalletSnapshot, UpdateAdminWalletRefundGatewayInput,
     UpdateWalletRechargeCheckoutInput, WalletLookupKey, WalletMutationOutcome,
@@ -160,9 +162,10 @@ use aether_data_contracts::repository::video_tasks::{
 use aether_runtime_state::RuntimeQueueStore;
 
 pub(crate) use self::referrals::{
-    ReferralAdminStats, ReferralMutationStatus, ReferralReconciliationSummary,
-    ReferralRelationshipListQuery, ReferralRelationshipRecord, ReferralRewardConfig,
-    ReferralRewardListQuery, ReferralRewardRecord, ReferralUserDashboard,
+    ReferralAdminOverviewStats, ReferralAdminStats, ReferralMutationStatus,
+    ReferralReconciliationSummary, ReferralRelationshipListQuery, ReferralRelationshipRecord,
+    ReferralRewardConfig, ReferralRewardDetail, ReferralRewardListQuery, ReferralRewardRecord,
+    ReferralUserDashboard,
 };
 
 #[derive(Clone, Default)]

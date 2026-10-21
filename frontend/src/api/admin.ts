@@ -1002,6 +1002,19 @@ export const adminApi = {
   },
 
   // 更新系统配置
+  async updateReferralSettings(payload: {
+    referral_enabled?: boolean
+    referral_reward_mode?: string
+    referral_recharge_percent?: number
+    referral_headcount_amount_usd?: number
+    referral_headcount_trigger?: string
+    require_email_verification?: boolean
+  }): Promise<void> {
+    await apiClient.put('/api/admin/system/referral-settings', payload)
+    cache.delete(ALL_SYSTEM_CONFIGS_CACHE_KEY)
+    for (const key of Object.keys(payload)) cache.delete(buildCacheKey('admin:system:config', { key }))
+  },
+
   async updateSystemConfig(
     key: string,
     value: unknown,
@@ -1288,6 +1301,8 @@ export const adminApi = {
 
   // Stats / Leaderboards
   async getLeaderboardUsers(params?: {
+    from?: string
+    to?: string
     start_date?: string
     end_date?: string
     preset?: string
@@ -1302,7 +1317,7 @@ export const adminApi = {
     include_inactive?: boolean
     exclude_admin?: boolean
     user_group_id?: string
-  }): Promise<LeaderboardResponse> {
+  }, options?: AdminAnalyticsRequestOptions): Promise<LeaderboardResponse> {
     const cacheKey = buildCacheKey('admin:stats:leaderboard:users', params)
     return cachedRequest(
       cacheKey,
@@ -1312,11 +1327,13 @@ export const adminApi = {
         })
         return response.data
       },
-      20 * 1000
+      options?.skipCache ? 0 : 20 * 1000
     )
   },
 
   async getLeaderboardUserGroups(params?: {
+    from?: string
+    to?: string
     start_date?: string
     end_date?: string
     preset?: string
@@ -1330,7 +1347,7 @@ export const adminApi = {
     model?: string
     include_inactive?: boolean
     exclude_admin?: boolean
-  }): Promise<LeaderboardResponse> {
+  }, options?: AdminAnalyticsRequestOptions): Promise<LeaderboardResponse> {
     const cacheKey = buildCacheKey('admin:stats:leaderboard:user-groups', params)
     return cachedRequest(
       cacheKey,
@@ -1341,7 +1358,7 @@ export const adminApi = {
         )
         return response.data
       },
-      20 * 1000
+      options?.skipCache ? 0 : 20 * 1000
     )
   },
 
@@ -1621,6 +1638,8 @@ export const adminApi = {
 
   async getTimeSeries(
     params?: {
+      from?: string
+      to?: string
       start_date?: string
       end_date?: string
       preset?: string

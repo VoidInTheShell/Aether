@@ -14,6 +14,7 @@ use crate::{
 impl AppState {
     pub(crate) async fn list_admin_wallets(
         &self,
+        user_id: Option<&str>,
         status: Option<&str>,
         owner_type: Option<&str>,
         limit: usize,
@@ -22,6 +23,7 @@ impl AppState {
         let page = self
             .data
             .list_admin_wallets(&AdminWalletListQuery {
+                user_id: user_id.map(ToOwned::to_owned),
                 status: status.map(ToOwned::to_owned),
                 owner_type: owner_type.map(ToOwned::to_owned),
                 limit,
@@ -30,6 +32,26 @@ impl AppState {
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
         Ok((page.items, page.total))
+    }
+
+    pub(crate) async fn find_admin_wallet_transaction(
+        &self,
+        wallet_id: &str,
+        transaction_id: &str,
+    ) -> Result<Option<StoredAdminWalletTransaction>, GatewayError> {
+        #[cfg(test)]
+        if self.admin_wallet_transaction_store.is_some() {
+            return Ok(self
+                .list_admin_wallet_transactions(wallet_id, usize::MAX, 0)
+                .await?
+                .0
+                .into_iter()
+                .find(|tx| tx.id == transaction_id));
+        }
+        self.data
+            .find_admin_wallet_transaction(wallet_id, transaction_id)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
     pub(crate) async fn list_admin_wallet_ledger(

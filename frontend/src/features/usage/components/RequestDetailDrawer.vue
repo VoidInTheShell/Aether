@@ -233,6 +233,14 @@
                       :requested="serviceTierFacts.requested"
                       :price-multiplier="processingTierPriceMultiplier"
                     />
+                    <div
+                      v-if="detail.chat_pii_redaction"
+                      data-request-detail-pii-redaction
+                      class="mt-3 flex items-start gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-400"
+                    >
+                      <ShieldCheck class="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      <span>此请求触发了敏感信息保护：发送给上游供应商的内容已将敏感信息替换为占位符。</span>
+                    </div>
                   </div>
 
                   <!-- 分隔线 -->
@@ -913,7 +921,7 @@ import Separator from '@/components/ui/separator.vue'
 import Skeleton from '@/components/ui/skeleton.vue'
 import Tabs from '@/components/ui/tabs.vue'
 import TabsContent from '@/components/ui/tabs-content.vue'
-import { AlertTriangle, Check, Columns2, RefreshCw, X, Monitor, Server, MessageSquareText, Code2, Terminal, Play } from 'lucide-vue-next'
+import { AlertTriangle, Check, Columns2, RefreshCw, X, Monitor, Server, MessageSquareText, Code2, Terminal, Play, ShieldCheck } from 'lucide-vue-next'
 import { dashboardApi, type RequestBodyField, type RequestDetail } from '@/api/dashboard'
 import { formatRequestBodyLoadError, formatStoredBodyLoadError } from '../utils/body-load-error'
 import type { ImageProgress, RequestTrace } from '@/api/requestTrace'
@@ -996,6 +1004,10 @@ const emit = defineEmits<{
     cacheReadInputTokens?: number | null
     cost?: number | null
     actualCost?: number | null
+    billingMultiplier?: number | null
+    billingCost?: number | null
+    routingGroupId?: string | null
+    routingGroupName?: string | null
     responseTimeMs?: number | null
     firstByteTimeMs?: number | null
     isStream?: boolean | null
@@ -1011,11 +1023,13 @@ const emit = defineEmits<{
     apiFormat?: string | null
     endpointApiFormat?: string | null
     hasFormatConversion?: boolean | null
+    chatPiiRedaction?: boolean | null
     targetModel?: string | null
     requestedReasoningEffort?: string | null
     reasoningEffort?: string | null
     serviceTier?: string | null
     actualServiceTier?: string | null
+    responseModel?: string | null
     imageProgress?: ImageProgress | null
     errorMessage?: string | null
     updatedAt?: string | null
@@ -1158,6 +1172,7 @@ type HeaderModelTextField =
   | 'model'
   | 'target_model'
   | 'model_version'
+  | 'response_model'
   | 'request_type'
   | 'requested_reasoning_effort'
   | 'reasoning_effort'
@@ -1166,6 +1181,7 @@ type HeaderModelTextField =
 
 const FINAL_PROVIDER_HEADER_FIELDS = new Set<HeaderModelTextField>([
   'target_model',
+  'response_model',
   'reasoning_effort',
   'service_tier',
   'actual_service_tier',
@@ -1252,6 +1268,7 @@ watch(
     props.summaryRecord?.model,
     props.summaryRecord?.target_model,
     props.summaryRecord?.model_version,
+    props.summaryRecord?.response_model,
     props.summaryRecord?.request_type,
     props.summaryRecord?.requested_reasoning_effort,
     props.summaryRecord?.reasoning_effort,
@@ -1298,6 +1315,7 @@ function emitDetailRequestState(nextDetail: RequestDetail) {
   const reasoningEffort = resolveHeaderModelTextField('reasoning_effort', nextDetail)
   const serviceTier = resolveHeaderModelTextField('service_tier', nextDetail)
   const actualServiceTier = resolveHeaderModelTextField('actual_service_tier', nextDetail)
+  const responseModel = resolveHeaderModelTextField('response_model', nextDetail)
 
   emit('requestState', {
     id,
@@ -1314,6 +1332,10 @@ function emitDetailRequestState(nextDetail: RequestDetail) {
     cacheReadInputTokens: nextDetail.cache_read_input_tokens ?? null,
     cost: detailTotalCost(nextDetail),
     actualCost: nextDetail.actual_cost ?? null,
+    billingMultiplier: nextDetail.billing_multiplier,
+    billingCost: nextDetail.billing_cost,
+    routingGroupId: nextDetail.routing_group_id ?? null,
+    routingGroupName: nextDetail.routing_group_name ?? null,
     responseTimeMs: nextDetail.response_time_ms ?? undefined,
     firstByteTimeMs: nextDetail.first_byte_time_ms ?? null,
     isStream: nextDetail.is_stream ?? null,
@@ -1329,11 +1351,13 @@ function emitDetailRequestState(nextDetail: RequestDetail) {
     apiFormat: nextDetail.api_format ?? null,
     endpointApiFormat: nextDetail.endpoint_api_format ?? null,
     hasFormatConversion: nextDetail.has_format_conversion ?? null,
+    chatPiiRedaction: nextDetail.chat_pii_redaction ?? null,
     ...(targetModel ? { targetModel } : {}),
     ...(requestedReasoningEffort ? { requestedReasoningEffort } : {}),
     ...(reasoningEffort ? { reasoningEffort } : {}),
     ...(serviceTier ? { serviceTier } : {}),
     ...(actualServiceTier ? { actualServiceTier } : {}),
+    ...(responseModel ? { responseModel } : {}),
     errorMessage: nextDetail.error_message ?? undefined,
     updatedAt: nextDetail.updated_at ?? undefined,
   })
@@ -1610,7 +1634,7 @@ const headerModelRecord = computed(() => {
   return {
     model: resolveHeaderModelTextField('model', currentDetail) ?? '-',
     target_model: resolveHeaderModelTextField('target_model', currentDetail),
-    model_version: resolveHeaderModelTextField('model_version', currentDetail),
+    response_model: resolveHeaderModelTextField('response_model', currentDetail),
     request_type: resolveHeaderModelTextField('request_type', currentDetail),
     requested_reasoning_effort: resolveHeaderModelTextField(
       'requested_reasoning_effort',

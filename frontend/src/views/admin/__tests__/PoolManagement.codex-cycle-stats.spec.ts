@@ -35,6 +35,10 @@ const routeMocks = vi.hoisted(() => ({
   }),
 }))
 
+const countdownMocks = vi.hoisted(() => ({
+  isExpired: false,
+}))
+
 const proxyStoreMocks = vi.hoisted(() => ({
   ensureLoaded: vi.fn(),
 }))
@@ -106,7 +110,7 @@ vi.mock('@/composables/useCountdownTimer', async () => {
       start: vi.fn(),
     }),
     getCodexResetCountdown: () => ({
-      isExpired: false,
+      isExpired: countdownMocks.isExpired,
       text: '1h',
     }),
   }
@@ -340,12 +344,24 @@ vi.mock('@/components/ui/refresh-button.vue', async () => {
 })
 
 vi.mock('@/features/pool/components/PoolSchedulingDialog.vue', async () => {
-  const { defineComponent } = await import('vue')
+  const { defineComponent, h } = await import('vue')
   return {
     default: defineComponent({
       name: 'PoolSchedulingDialogStub',
-      setup() {
-        return () => null
+      props: {
+        providerId: { type: String, required: true },
+        currentConfig: { type: Object, default: null },
+      },
+      emits: ['saved'],
+      setup(props, { emit }) {
+        return () => h('button', {
+          'data-testid': 'save-pool-scheduling',
+          'data-reserve': String(props.currentConfig?.reserve_minimum_quota ?? false),
+          onClick: () => emit('saved', {
+            id: props.providerId,
+            pool_advanced: { ...props.currentConfig, reserve_minimum_quota: false },
+          }),
+        }, '保存调度测试')
       },
     }),
   }
@@ -592,6 +608,7 @@ beforeEach(() => {
   window.sessionStorage.clear()
   routeMocks.patchQuery.mockClear()
   proxyStoreMocks.ensureLoaded.mockClear()
+  countdownMocks.isExpired = false
 
   endpointMocks.getPoolOverview.mockReset()
   endpointMocks.getPoolSchedulingPresets.mockReset()
@@ -722,6 +739,44 @@ describe('PoolManagement Codex cycle stats mode', () => {
       .filter(Boolean)
     expect(resetTexts).toContain('1h')
     expect(root.textContent).toContain('生图')
+  })
+
+  it('shows expired Codex quota windows as fully restored', async () => {
+    countdownMocks.isExpired = true
+    const expiredKey = createPoolKey('codex', {
+      status_snapshot: {
+        oauth: { code: 'valid' },
+        account: { code: 'ok', blocked: false },
+        quota: {
+          code: 'ok',
+          exhausted: false,
+          provider_type: 'codex',
+          windows: [
+            {
+              code: '5h',
+              label: '5H',
+              scope: 'account',
+              remaining_ratio: 0.12,
+              reset_at: 1_700_000_000,
+              window_minutes: 300,
+            },
+          ],
+        },
+      },
+    })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(expiredKey))
+    endpointMocks.getProvider.mockResolvedValue(createProvider('codex'))
+
+    const root = mountPoolManagement()
+    await settle()
+
+    // 倒计时归零后进度条与文本按“已重置”显示 100%，不再显示旧百分比。
+    expect(root.querySelector('[data-testid="pool-quota-meter-text"]')?.textContent?.trim()).toBe('100.0%')
+    const track = root.querySelector('[data-testid="pool-quota-progress-track"]')
+    const bar = track?.firstElementChild as HTMLElement | null
+    expect(bar?.style.width).toBe('100%')
+    expect(root.querySelector('[data-testid="pool-quota-reset-text"]')).toBeNull()
   })
 
   it('labels Codex quota by the actual refresh window duration', async () => {
@@ -1277,5 +1332,81 @@ describe('PoolManagement Codex cycle stats mode', () => {
     await settle()
 
     expect(disabledRoot.querySelector('[data-testid="pool-demand-metrics-button"]')).toBeNull()
+  })
+
+  it('reloads account scheduling state immediately after disabling minimum quota reserve', async () => {
+    const key = createPoolKey('codex', {
+      scheduling_status: 'blocked',
+      scheduling_reason: 'account_quota_exhausted',
+      scheduling_label: '额度耗尽',
+    })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(key))
+    endpointMocks.getProvider.mockResolvedValue(createProvider('codex', {
+      pool_advanced: { reserve_minimum_quota: true },
+    }))
+    const root = mountPoolManagement()
+    await settle()
+    expect(root.querySelector('tbody')?.textContent).toContain('额度耗尽')
+    endpointMocks.listPoolKeys.mockClear()
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage({
+      ...key,
+      scheduling_status: 'available',
+      scheduling_reason: 'available',
+      scheduling_label: '可用',
+    }))
+
+    root.querySelector<HTMLButtonElement>('[data-testid="save-pool-scheduling"]')?.click()
+    await settle()
+
+    expect(endpointMocks.listPoolKeys).toHaveBeenCalledWith(
+      'codex-provider', expect.anything(), { cacheTtlMs: 0 },
+    )
+    expect(root.querySelector('tbody')?.textContent).not.toContain('额度耗尽')
+    expect(root.querySelector('tbody')?.textContent).toContain('可用')
+  })
+
+  it('shows 17% remaining without marking a schedulable account exhausted when reserve is enabled', async () => {
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
+    endpointMocks.getProvider.mockResolvedValue(createProvider('codex', {
+      pool_advanced: { reserve_minimum_quota: true },
+    }))
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(createPoolKey('codex', {
+      scheduling_status: 'available',
+      scheduling_reason: 'available',
+      scheduling_label: '可用',
+      status_snapshot: {
+        account: { code: 'ok', blocked: false },
+        quota: {
+          code: 'ok',
+          exhausted: false,
+          provider_type: 'codex',
+          windows: [{ code: '5h', used_ratio: 0.83, remaining_ratio: 0.17 }],
+        },
+        oauth: { code: 'none' },
+      },
+    })))
+    const root = mountPoolManagement()
+    await settle()
+
+    expect(root.querySelector('[data-testid="pool-quota-meter-text"]')?.textContent).toBe('17.0%')
+    expect(root.querySelector('tbody')?.textContent).toContain('可用')
+    expect(root.querySelector('tbody')?.textContent).not.toContain('额度耗尽')
+  })
+
+  it('does not replace saved scheduling settings with an older provider detail response', async () => {
+    let resolveOldProvider!: (provider: ReturnType<typeof createProvider>) => void
+    endpointMocks.getProvider.mockReturnValue(new Promise((resolve) => { resolveOldProvider = resolve }))
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(createPoolKey()))
+    const root = mountPoolManagement()
+    await settle()
+
+    root.querySelector<HTMLButtonElement>('[data-testid="save-pool-scheduling"]')?.click()
+    await settle()
+    resolveOldProvider(createProvider('codex', { pool_advanced: { reserve_minimum_quota: true } }))
+    await settle()
+
+    expect(root.querySelector('[data-testid="save-pool-scheduling"]')?.getAttribute('data-reserve')).toBe('false')
   })
 })
